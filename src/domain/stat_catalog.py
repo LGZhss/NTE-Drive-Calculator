@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -61,10 +62,11 @@ class StatCatalog:
             weight_pool=data.get("weight_pool", []) or [],
         )
 
-    @property
+    @cached_property
     def valid_sub_stats(self) -> set[str]:
         return set(self.gold_base_values.keys())
 
+    @cached_property
     def _weight_aliases(self) -> dict[str, str]:
         aliases = dict(self.WEIGHT_NAME_ALIASES)
         aliases.update(self.stat_alias_mapping or {})
@@ -87,7 +89,7 @@ class StatCatalog:
         candidates = [candidate for candidate in dict.fromkeys(expanded_candidates) if candidate]
 
         valid_stats = self.valid_sub_stats
-        aliases = self._weight_aliases()
+        aliases = self._weight_aliases
         for candidate in candidates:
             short_name = self.OCR_SHORT_STAT_ALIASES.get(candidate.rstrip("%"))
             if short_name:
@@ -148,7 +150,7 @@ class StatCatalog:
         clean_name = str(raw_name or "").strip()
         if not clean_name:
             return "未知主词条"
-        aliases = self._weight_aliases()
+        aliases = self._weight_aliases
         short_name = self.OCR_SHORT_STAT_ALIASES.get(clean_name.rstrip("%"))
         if short_name:
             # 卡带的三类基础面板主词条均为百分比，OCR 常遗漏“百分比”二字。
@@ -198,4 +200,4 @@ class StatCatalog:
         ))
 
     def flexible_weight_name(self, stat_name: str) -> str:
-        return self._weight_aliases().get(stat_name, stat_name)
+        return self._weight_aliases.get(stat_name, stat_name)
