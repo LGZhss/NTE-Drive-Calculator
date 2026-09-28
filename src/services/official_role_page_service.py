@@ -400,7 +400,11 @@ def load_official_role_detail(
         UserDataDao(user_database_path) as user_dao,
     ):
         character = static_dao.get_character(character_id)
-        catalog_scope = static_dao.get_catalog_scope()
+        # 目录作用域与账号设置副本对每个角色都相同；逐角色读取会按角色数放大。
+        catalog_scope = cached(
+            ("catalog_scope", str(static_database_path or "default")),
+            static_dao.get_catalog_scope,
+        )
         if character is None:
             raise ValueError(f"官方角色不存在：{character_id}")
         growth_rows = static_dao.list_character_panel_growth(character_id)
@@ -660,7 +664,10 @@ def load_official_role_detail(
         ) or {}
         account_weight_record = user_dao.get_character_weight_preferences(character_id)
         world_bonus = WorldBonusSettings.from_payload(
-            user_dao.list_application_setting_copies().get(WORLD_BONUS_SETTING_KEY)
+            cached(
+                ("application_setting_copies", str(user_database_path or "default")),
+                user_dao.list_application_setting_copies,
+            ).get(WORLD_BONUS_SETTING_KEY)
         )
         weight_record = account_weight_record or public_weight_record
         weights = {

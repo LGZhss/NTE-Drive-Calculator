@@ -121,18 +121,24 @@ class ScoringEngine:
                     str(attribute["attribute_id"]): self._scoring_property_name(attribute)
                     for attribute in static_dao.list_equipment_attributes()
                 }
-                for character in static_dao.list_role_template_characters(preferred_ids):
+                characters = static_dao.list_role_template_characters(preferred_ids)
+                # 逐角色查询会把角色数放大成上百条 SQL；先批量取回再在内存里分配。
+                recommended_weights = static_dao.map_character_recommended_weights(
+                    [int(character["character_id"]) for character in characters]
+                )
+                account_weights = (
+                    user_dao.list_character_weight_preferences()
+                    if user_dao is not None
+                    else {}
+                )
+                for character in characters:
                     character_id = int(character["character_id"])
-                    record = (
-                        user_dao.get_character_weight_preferences(character_id)
-                        if user_dao is not None
-                        else None
-                    )
+                    record = account_weights.get(character_id)
                     if record is None or is_unmodified_account_weight_cache(record):
                         record = effective_workshop_recommended_weights(
                             None,
                             character_id,
-                            static_dao.get_character_recommended_weights(character_id),
+                            recommended_weights.get(character_id),
                         )
                     if record is None:
                         continue
@@ -159,7 +165,7 @@ class ScoringEngine:
                 if user_dao is not None:
                     for character in user_dao.list_custom_characters():
                         character_id = int(character["character_id"])
-                        record = user_dao.get_character_weight_preferences(character_id)
+                        record = account_weights.get(character_id)
                         if record is None:
                             continue
                         weights = {

@@ -12,6 +12,36 @@ from .protocols import StaticDataDaoMixinHost
 class StaticGameDataCharacterGrowthQueriesMixin(StaticDataDaoMixinHost):
     """Expose awaken effects, official panel growth and the skill catalogue."""
 
+    def list_character_shape_bonuses(self) -> dict[int, dict[str, Any]]:
+        """批量返回全部官方角色的额外形状规则，供逐角色装配前一次性读取。"""
+
+        properties: dict[str, list[dict[str, Any]]] = {}
+        for row in self._rows(
+            """
+            SELECT p.logical_character_key, p.property_id, p.display_value, p.ordinal,
+                   a.display_name_zh, a.filter_name_zh, a.show_percent
+            FROM logical_character_shape_bonus_property AS p
+            JOIN equipment_attribute AS a ON a.attribute_id = p.property_id
+            ORDER BY p.logical_character_key, p.ordinal
+            """
+        ):
+            logical_key = str(row.pop("logical_character_key"))
+            properties.setdefault(logical_key, []).append(row)
+        bonuses: dict[int, dict[str, Any]] = {}
+        for row in self._rows(
+            """
+            SELECT a.character_id, a.logical_character_key,
+                   b.representative_character_id, b.shape_label,
+                   b.shape_grid_count, b.source_kind
+            FROM character_annotation AS a
+            JOIN logical_character_shape_bonus AS b
+              ON b.logical_character_key = a.logical_character_key
+            """
+        ):
+            row["properties"] = properties.get(str(row["logical_character_key"]), [])
+            bonuses[int(row["character_id"])] = row
+        return bonuses
+
     def list_character_awaken_effects(self, character_id: int) -> list[dict[str, Any]]:
         """返回角色六觉与三/六觉共鸣，含可直接应用的技能等级加成。"""
 

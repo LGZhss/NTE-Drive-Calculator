@@ -33,7 +33,7 @@ def load_official_role_fork_templates(
     with StaticGameDataDao(static_database_path) as static_dao:
         return {
             "source": "game_static.sqlite3",
-            "static_dataset": static_dao.summary()["dataset"],
+            "static_dataset": static_dao.dataset_info(),
             "roles": static_dao.list_role_template_characters(),
             "forks": static_dao.list_fork_templates(),
         }

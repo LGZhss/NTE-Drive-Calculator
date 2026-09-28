@@ -27,6 +27,7 @@
 | F9 | 装备详情曲线按等级重复查询，且物品缺失时抛未处理的 `StopIteration` | `equipment_catalog_model.py` 原先每个等级各查一次曲线（53 属性 × 22 级 ≈ 1166 次），`next(...)` 无默认值 | DAO 新增 `evaluate_equipment_base_attribute_curve_levels`（一次读曲线、内存求值），`item_curves` 改为批量并返回空曲线 | `tests/test_static_catalog_equipment_page_ui.py` 新增 2 条（红：`StopIteration` + 读取次数 1166 ≠ 53） | ✅ 已修 |
 | F10 | 「清空配装」逐条写库、失败后不刷新界面 | `equipment_display_controller.py` 原先循环调用单条 `deactivate_loadout_plan`，中途失败留下部分已生效状态且跳过缓存失效；并用 `getattr(..., lambda: [])` 掩盖缺失方法 | DAO 新增 `deactivate_loadout_plans`（校验后单事务批量写入）；控制器改用它，并在 `finally` 中统一失效缓存与刷新 | `tests/test_loadout_plan_batch_deactivate_dao.py`（3 条：非法输入整体回滚、批量去重生效、空批次无副作用） | ✅ 已修 |
 | F12 | 角色头像存在两套查找路径（正式图鉴 + `config/templates/roles` 遗留兼容查找） | `warehouse.py` 的 `_legacy_character_avatar` 只服务遗留兼容查找，`_role_avatar_index` 是为它新增的目录索引 | 经裁定该遗留查找已无实际使用者，显式移除：`_role_avatar_index`、`_legacy_character_avatar`、`ROLE_AVATAR_ALIASES`、`normalize_role_avatar_name` 与回退调用一并删除，头像统一取 `equipped_character_icon_path` | `tests/test_static_storage_perf.py`、`tests/test_warehouse_inventory.py` 中过时用例删除；受影响测试通过 | ✅ 已修 |
+| F13 | 配装目录重建的逐角色 N+1（实测 1417 条 SQL、中位 1174 ms） | `legacy_allocation_static_catalog.py` 逐角色 `get_equipment_plan`（5 条/次）、`get_character_default_suit`、`get_effective_character_shape_bonus`（2 条）、好感度加成（3 条）；`ScoringEngine._load_roles_from_sqlite` 逐角色读账号权重与推荐权重；`project_equipment_items_to_max_level` 空列表下仍整表读装备；`StaticGameDataDao.summary()` 逐表 COUNT（约 115 条） | 新增批量 DAO：`list_character_shape_bonuses`、`list_character_default_suits`、`list_character_likeability_bonuses`、`map_character_recommended_weights`、`list_character_weight_preferences`、`dataset_info`；图纸改用既有 `list_equipment_plans`；空输入短路；`summary()` 合并为单条多子查询；`load_official_role_detail` 的目录作用域与账号设置副本按请求缓存 | 实测 **1417 → 887 条 SQL（−37%）**、中位 **1174 → 1027 ms**；67 条相关测试通过、mypy 无新增 | ✅ 已修 |
 | F11 | 账号切换/启动在 GUI 线程同步重建配装目录 **1174 ms** | `_load_data` 原先同步执行 `_read_allocation_catalog`，而同一份逻辑在 `_refresh_execute` 里包在 WorkerThread（线程模型不一致）；直接委托会因 `_refresh_execute` 在非 QWidget 宿主反向调用 `_load_data` 而无限递归 | 抽出 `_read_and_apply_allocation_catalog` 与 `_start_allocation_catalog_worker`；`_load_data` 对 GUI 宿主走 worker 并支持完成回调；`app.py` 的收尾（页面刷新、`account.switch_succeeded` 日志）移入 mixin 的 `_finish_account_switch`，由回调在目录就绪后执行，避免「完成日志早于数据就绪」 | `tests/test_main_window_catalog_load_boundaries.py`（2 条：非 GUI 宿主保持同步；GUI 宿主不得在调用线程读取——改动前断言失败） | ✅ 已修 |
 
 ## 3. 实测收益（`tools/quality/bench`）
@@ -38,7 +39,7 @@
 | 属性上限排除搜索（每轮） | 403 ms | **19.5 ms** | 复用已评分结果 |
 | 快照写入（600 件） | 209 ms | **185 ms** | `executemany` |
 | 装备详情曲线（53 属性） | 144 ms | **16 ms** | 每条曲线只读一次（1166 → 53 次查询） |
-| 配装目录重建：GUI 线程阻塞 | 1174 ms | **≈0 ms（转后台）** | 读取耗时本身不变，但不再阻塞界面 |
+| 配装目录重建 | 1174 ms（1417 条 SQL） | **1027 ms（887 条 SQL）** | GUI 线程阻塞已消除（F11）；读取本身减少 37% 查询（F13） |
 | 原生会话关闭的 GUI 线程等待（最坏） | ≈6 s | **≈2 s** | HUD 超时 2.0→0.5、快照域 1.5→0.4；实例不可用时跳过 |
 
 ## 4. 已定位但未修复项（含原因）
@@ -47,8 +48,8 @@
 | --- | --- | --- | --- |
 | N1 | 正式库存指针可被「仅含本次变更 UID」的局部/按角色响应推进 | `src/services/warehouse_state_management.py:562-588`、`src/services/inventory_sync_service.py:572-597`；与 `begin_full_inventory_guard` 的全量冻结、稳定器注释（`inventory_snapshot_stabilizer.py:268-278`）冲突 | 严重度最高，但需改动同步状态机与稳定器交互，必须先有集成测试锁定「局部响应不得成为当前库存」，本轮时间不足以安全完成 |
 | N2 | 轴分页缺 `complete` 字段时默认判为已完成 | `battle_axis_dao.py:249,264` 用 `get("complete", True)`；`nte_core_battle.py:590` `default=True`；而 `battle_axis_finalization_dao.py:127,156` 用 `default=False` | 缺上游/实机证据证明 Core 是否总是发送该字段；直接改默认值可能影响分页终止条件，需实机核对后再动 |
-| N3 | 账号切换的 **主线程阻塞**已消除（F11），但目录重建本身仍是 1174 ms，只是搬到了后台线程 | 同 F11 | 后台读取仍需约 1.2 秒（一次重建 1414 条 SQL），期间执行页会短暂保持旧目录；若要缩短这段等待，需要处理 N4 的逐角色 N+1 |
-| N4 | N+1 查询放大（剩余） | `legacy_allocation_static_catalog.py:183-245,250-280`（一次重建 1414 条 SQL 的主因）、`weighted_shell.py:201-208`、`configuration/controller.py:163-193` | 需新增批量 DAO 接口并逐个回归，属结构性改动；`equipment_catalog_model.py` 的部分已在 F9 修复 |
+| N3 | 配装目录重建仍约 1.0 s（一次重建 887 条 SQL），已从 GUI 线程移出但耗时未降到底 | 同 F11/F13 | 后台读取期间执行页会短暂保持旧目录；剩余耗时集中在 `load_official_role_detail` 的逐角色详情（约 500 条 SQL，见 N4） |
+| N4 | N+1 查询放大（剩余部分） | `official_role_page_service.load_official_role_detail` 被配装目录按角色调用（技能、觉醒、图纸、推荐权重等，约 500 条 SQL）；`weighted_shell.py:201-208` 仍有逐角色项 | 目录只需弧盘投影，需要一个「只算投影」的批量入口，涉及默认档案解析；F13 已消除其余放大项 |
 | N9 | 「清空配装」控制器路径缺少 Qt 层回归测试 | `equipment_display_controller.py` 的 `_clear_all_equipment` 依赖 `QMessageBox` | DAO 原子性已由 F10 的测试覆盖；控制器分支（失败提示、锁定跳过、`finally` 刷新）需 Qt 交互测试，本轮未补 |
 | N5 | 静态库共享连接跨线程 `execute` 无锁保护；`close_shared_connections()` 生产无调用点 | `static_game_data_dao.py` `check_same_thread=False`，锁只保护字典 | 需先确定调用是否跨线程并设计连接池，避免以锁换死锁 |
 | N6 | `ScanWorkerThread.run` 无 `finally` 释放 scanner；退出时主线程 `worker.wait(5000)`×3 | `src/app/workers.py:64-79`（对比 `:258-259` 有释放）、`scanning/controller.py:230-235` | 依赖真实 QThread 与 Qt 事件循环，无法用纯 Python 单测稳定复现 |

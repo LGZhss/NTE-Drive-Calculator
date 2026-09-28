@@ -14,7 +14,6 @@ from typing import Any, Iterable, NoReturn
 import tempfile
 import threading
 from functools import lru_cache
-from src.domain.recommended_weights import workshop_weight_source_ids
 from .static_game_data_metadata import (
     MINIMUM_SUPPORTED_SCHEMA_VERSION,
     SCHEMA_VERSION,
@@ -146,6 +145,9 @@ from src.storage.sqlite.static_game_data_character_growth_queries import (
 from src.storage.sqlite.static_game_data_skill_damage_queries import (
     StaticGameDataSkillDamageQueriesMixin,
 )
+from src.storage.sqlite.static_game_data_weight_queries import (
+    StaticGameDataWeightQueriesMixin,
+)
 
 
 class StaticGameDataDao(
@@ -156,6 +158,7 @@ class StaticGameDataDao(
     StaticGameDataBuffQueriesMixin,
     StaticGameDataCombatBlueprintQueriesMixin,
     StaticGameDataSkillDamageQueriesMixin,
+    StaticGameDataWeightQueriesMixin,
     StaticGameDataExtendedQueriesMixin,
 ):
     """面向当前发行静态数据库 schema 的轻量查询边界。
@@ -308,8 +311,9 @@ class StaticGameDataDao(
         )
         if dataset is None:
             raise StaticGameDataError("静态数据库缺少数据集元信息")
-        counts = {}
-        available_tables: set[str] | None = None
+        # 逐表 COUNT 会把一次 summary 放大成上百条 SQL（SUMMARY_TABLES 约 115 项），
+        # 合并为一条多子查询即可，结果不变。
+        tables = list(SUMMARY_TABLES)
         if self._schema_version != SCHEMA_VERSION:
             available_tables = {
                 str(row["name"])
@@ -317,17 +321,33 @@ class StaticGameDataDao(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        for table in SUMMARY_TABLES:
-            if available_tables is not None and table not in available_tables:
-                continue
-            row = self._one(f"SELECT COUNT(*) AS count FROM {table}")
-            counts[table] = int((row or {}).get("count", 0))
+            tables = [table for table in tables if table in available_tables]
+        counts: dict[str, int] = {}
+        if tables:
+            row = self._one(
+                "SELECT "
+                + ", ".join(
+                    f'(SELECT COUNT(*) FROM "{table}") AS "{table}"'
+                    for table in tables
+                )
+            ) or {}
+            counts = {table: int(row.get(table, 0)) for table in tables}
         return {
             "schema_version": self._schema_version,
             "database_path": str(self.database_path),
             "dataset": dataset,
             "counts": counts,
         }
+
+    def dataset_info(self) -> dict[str, Any]:
+        """只返回数据集元信息，供仅需 dataset 的调用方免去 summary 的逐表计数。"""
+
+        dataset = self._one(
+            "SELECT dataset_id, importer_version, built_at_utc FROM dataset"
+        )
+        if dataset is None:
+            raise StaticGameDataError("静态数据库缺少数据集元信息")
+        return dataset
 
     def application_setting_defaults(self) -> dict[str, dict[str, Any]]:
         defaults: dict[str, dict[str, Any]] = {}
@@ -483,56 +503,6 @@ class StaticGameDataDao(
             selected.values(),
             key=lambda character: int(character["character_id"]),
         )
-
-    def get_character_recommended_weights(self, character_id: int) -> dict[str, Any] | None:
-        """精确工坊记录优先；主角另一形态的工坊记录优先于通用发行兜底。"""
-
-        fallback = None
-        for source_id in workshop_weight_source_ids(character_id):
-            row = self._get_character_recommended_weights(source_id)
-            if source_id == int(character_id):
-                fallback = row
-            if row and row.get("properties") and row.get("source_kind") != "default":
-                return {**row, "character_id": int(character_id)}
-        return fallback
-
-    def _get_character_recommended_weights(self, character_id: int) -> dict[str, Any] | None:
-        """读取开发期写入静态库的推荐权重；运行时不会调用外部 API。"""
-
-        recommendation = self._one(
-            """SELECT character_id, source_kind, source_item_id, source_name,
-                      source_updated_at_utc
-               FROM character_weight_recommendation WHERE character_id = ?""",
-            (int(character_id),),
-        )
-        if recommendation is None:
-            return None
-        properties = self._rows(
-            """SELECT property_id, weight, main_weight, ordinal
-               FROM character_weight_recommendation_property
-               WHERE character_id = ? ORDER BY ordinal""",
-            (int(character_id),),
-        )
-        recommendation["properties"] = properties
-        recommendation["property_weights"] = {
-            row["property_id"]: float(row["weight"])
-            for row in properties if float(row["weight"]) > 0
-        }
-        recommendation["main_property_weights"] = {
-            row["property_id"]: float(row["main_weight"])
-            for row in properties if float(row["main_weight"]) > 0
-        }
-        return recommendation
-
-    def list_character_recommended_weights(self) -> list[dict[str, Any]]:
-        return [
-            recommendation
-            for row in self._rows(
-                "SELECT character_id FROM character_weight_recommendation ORDER BY character_id"
-            )
-            if (recommendation := self.get_character_recommended_weights(int(row["character_id"])))
-            is not None
-        ]
 
     def get_character_graduation_template(
         self, character_id: int,
