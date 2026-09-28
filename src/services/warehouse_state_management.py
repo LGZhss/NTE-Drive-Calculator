@@ -585,7 +585,42 @@ class WarehouseStateManagementService:
         with self.dao_factory(self.database_path) as user_dao:
             if user_dao.current_inventory_snapshot_id() != plan.snapshot_id:
                 return None
+            # 状态 RPC 可能只回传本次变更的局部/按角色快照；即便它声明 complete，
+            # 用它替换当前库存也会把其余装备从正式库存里抹掉（与 apply 中「局部
+            # 响应应被忽略而不是导入为当前库存」的冻结守卫一致）。因此只有覆盖
+            # 当前完整库存全部 UID 的响应才允许替换。
+            current_uids = {
+                (int(row["uid_slot"]), int(row["uid_serial"]))
+                for row in user_dao.list_inventory_items(plan.snapshot_id)
+            }
+            if not current_uids <= self._snapshot_uid_pairs(packet):
+                return None
             return int(user_dao.import_inventory_snapshot(packet, source="nte_core"))
+
+    @staticmethod
+    def _snapshot_uid_pairs(packet: Mapping[str, Any]) -> frozenset[tuple[int, int]]:
+        """Extract the UID pairs declared by one inventory snapshot packet."""
+
+        payload = (
+            packet.get("params")
+            if packet.get("method") == "event.inventory.snapshot"
+            else packet
+        )
+        if not isinstance(payload, Mapping):
+            return frozenset()
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return frozenset()
+        pairs: set[tuple[int, int]] = set()
+        for item in items:
+            uid = item.get("uid") if isinstance(item, Mapping) else None
+            if not isinstance(uid, Mapping):
+                continue
+            try:
+                pairs.add((int(uid["slot"]), int(uid["serial"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return frozenset(pairs)
 
     @staticmethod
     def _report_progress(
