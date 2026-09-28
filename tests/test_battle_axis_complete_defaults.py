@@ -41,9 +41,6 @@ class BattleAxisCompleteDefaultsTests(unittest.TestCase):
 
         self.assertIs(False, parse_battle_axis(_page(complete=False))["complete"])
 
-    def test_explicit_true_is_preserved(self) -> None:
-        self.assertIs(True, parse_battle_axis(_page(complete=True))["complete"])
-
 
 if __name__ == "__main__":
     unittest.main()

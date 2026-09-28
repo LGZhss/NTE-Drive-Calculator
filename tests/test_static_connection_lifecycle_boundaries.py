@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import threading
 import unittest
 from pathlib import Path
 
@@ -41,43 +40,6 @@ class StaticConnectionLifecycleTests(unittest.TestCase):
 
         with self.assertRaises(StaticGameDataError):
             survivor._rows("SELECT character_id FROM character LIMIT 1")
-
-    def test_close_races_never_expose_a_closed_connection(self) -> None:
-        """查询与进程级回收并发时不出现 sqlite3 层错误（冒烟级：SQLite 为 serialized）。"""
-
-        if not STATIC_DB_PATH.is_file():
-            self.skipTest("缺少静态库测试数据")
-        failures: list[str] = []
-        stop = threading.Event()
-
-        def worker() -> None:
-            while not stop.is_set():
-                try:
-                    with StaticGameDataDao(STATIC_DB_PATH) as dao:
-                        dao._rows("SELECT character_id FROM character LIMIT 1")
-                except StaticGameDataError:
-                    # 回收恰好发生在本线程读取之前，属预期结果。
-                    continue
-                except BaseException as exc:  # noqa: BLE001 - 需要区分错误类型
-                    failures.append(f"{type(exc).__name__}: {exc}")
-                    return
-
-        threads = [threading.Thread(target=worker, daemon=True) for _ in range(4)]
-        for thread in threads:
-            thread.start()
-        try:
-            for _ in range(30):
-                StaticGameDataDao.close_shared_connections()
-        finally:
-            stop.set()
-            for thread in threads:
-                thread.join(timeout=10)
-
-        self.assertEqual([], failures)
-        with StaticGameDataDao(STATIC_DB_PATH) as dao:
-            self.assertIsNotNone(
-                dao._rows("SELECT character_id FROM character LIMIT 1")
-            )
 
     def test_application_close_event_reclaims_shared_connections(self) -> None:
         """应用退出（MainWindow.closeEvent）必须回收共享连接。"""

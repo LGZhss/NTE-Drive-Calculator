@@ -331,9 +331,8 @@ class StaticGameDataDao(
         )
         if dataset is None:
             raise StaticGameDataError("静态数据库缺少数据集元信息")
-        # 逐表 COUNT 会把一次 summary 放大成上百条 SQL（SUMMARY_TABLES 约 115 项），
-        # 合并为一条多子查询即可，结果不变。
-        tables = list(SUMMARY_TABLES)
+        counts = {}
+        available_tables: set[str] | None = None
         if self._schema_version != SCHEMA_VERSION:
             available_tables = {
                 str(row["name"])
@@ -341,17 +340,11 @@ class StaticGameDataDao(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            tables = [table for table in tables if table in available_tables]
-        counts: dict[str, int] = {}
-        if tables:
-            row = self._one(
-                "SELECT "
-                + ", ".join(
-                    f'(SELECT COUNT(*) FROM "{table}") AS "{table}"'
-                    for table in tables
-                )
-            ) or {}
-            counts = {table: int(row.get(table, 0)) for table in tables}
+        for table in SUMMARY_TABLES:
+            if available_tables is not None and table not in available_tables:
+                continue
+            row = self._one(f"SELECT COUNT(*) AS count FROM {table}")
+            counts[table] = int((row or {}).get("count", 0))
         return {
             "schema_version": self._schema_version,
             "database_path": str(self.database_path),
