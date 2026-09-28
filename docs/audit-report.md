@@ -85,9 +85,10 @@
 | # | 问题 | 未修原因 |
 | --- | --- | --- |
 | N2 | 轴分页缺 `complete` 字段时默认判为已完成（与最终化路径默认值相反） | 设备是否总会发送该字段属实机/上游协议证据；已固化当前判定并标注证据需求 |
-| N3 | 配装目录重建仍约 1.0 s（887 条 SQL），已从 GUI 线程移出 | 剩余耗时集中在 `load_official_role_detail` 的逐角色详情（约 500 条 SQL，见 N4） |
-| N4 | 逐角色 N+1 的剩余部分 | 目录只需弧盘投影，需要「只算投影」的批量入口，涉及默认档案解析 |
+| N3 | 配装目录重建仍约 1.0 s（887 条 SQL），已从 GUI 线程移出 | 剩余耗时分布在三处（见 N4 与 N11），其中两处**不在**逐角色查询里 |
+| N4 | 逐角色详情的剩余查询（`load_official_role_detail`） | 实测占比：单次 `_read_allocation_catalog` 中 `build_legacy_allocation_static_catalog` ≈0.956 s，其中 `load_official_role_detail`（24 次）≈0.774 s（约 **81%**）、账号库重复打开 27 次 ≈0.510 s。目录只需弧盘投影，需要「只算投影」的入口，涉及默认档案解析 |
 | N7 | 装备域完整性由背包域标志代替 | 需实机核对各域真实能力 |
+| N11 | 弧盘模板投影的纯 CPU 开销与账号库重复打开（**新发现**，量级不低于 N4） | cProfile：一次重建中 `fork_templates_as_weapon_models` ≈0.959 s（`_fork_stats_at_level` 4080 次、`fork_panel_stats` 4104 次、`_integer` **24.6 万次**、genexpr 8208 次），`list_fork_templates` 3 次 ≈0.364 s，`UserDataDao.__init__` 27 次 ≈0.510 s（含 `_migrate_schema` 0.348 s）。以上**不产生 SQL**，因此此前按 SQL 条数的统计看不到 | 本轮聚焦 N4 未动。按投入产出排序：**账号库复用（≈0.45 s，风险极低）> 弧盘投影缓存与 `_integer` 降频（≈0.9 s，纯 CPU、可逐项对比验证）> N4 投影模式（需逐角色输出对比测试）** |
 | N9 | 「清空配装」控制器分支缺 Qt 层回归测试 | DAO 原子性已由 F10 覆盖；控制器交互需 Qt 测试 |
 | N10 | `_template_root_candidates` / `_TEMPLATE_ROOTS` 成为只写不读的死访问器 | `configure_warehouse_view_template_roots` 是组合根 API，简化需同时动 `app.py` |
 
