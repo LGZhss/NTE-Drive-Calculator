@@ -26,6 +26,7 @@
 | F8 | `static_game_data_dao.py` 878 行超 800 行硬限 | 单一文件承载过多查询 | 拆出 `static_game_data_character_growth_queries.py`（878 → 680 行） | `tests/test_repository_hygiene.py` | ✅ 已修 |
 | F9 | 装备详情曲线按等级重复查询，且物品缺失时抛未处理的 `StopIteration` | `equipment_catalog_model.py` 原先每个等级各查一次曲线（53 属性 × 22 级 ≈ 1166 次），`next(...)` 无默认值 | DAO 新增 `evaluate_equipment_base_attribute_curve_levels`（一次读曲线、内存求值），`item_curves` 改为批量并返回空曲线 | `tests/test_static_catalog_equipment_page_ui.py` 新增 2 条（红：`StopIteration` + 读取次数 1166 ≠ 53） | ✅ 已修 |
 | F10 | 「清空配装」逐条写库、失败后不刷新界面 | `equipment_display_controller.py` 原先循环调用单条 `deactivate_loadout_plan`，中途失败留下部分已生效状态且跳过缓存失效；并用 `getattr(..., lambda: [])` 掩盖缺失方法 | DAO 新增 `deactivate_loadout_plans`（校验后单事务批量写入）；控制器改用它，并在 `finally` 中统一失效缓存与刷新 | `tests/test_loadout_plan_batch_deactivate_dao.py`（3 条：非法输入整体回滚、批量去重生效、空批次无副作用） | ✅ 已修 |
+| F11 | 账号切换/启动在 GUI 线程同步重建配装目录 **1174 ms** | `_load_data` 原先同步执行 `_read_allocation_catalog`，而同一份逻辑在 `_refresh_execute` 里包在 WorkerThread（线程模型不一致）；直接委托会因 `_refresh_execute` 在非 QWidget 宿主反向调用 `_load_data` 而无限递归 | 抽出 `_read_and_apply_allocation_catalog` 与 `_start_allocation_catalog_worker`；`_load_data` 对 GUI 宿主走 worker 并支持完成回调；`app.py` 的收尾（页面刷新、`account.switch_succeeded` 日志）移入 mixin 的 `_finish_account_switch`，由回调在目录就绪后执行，避免「完成日志早于数据就绪」 | `tests/test_main_window_catalog_load_boundaries.py`（2 条：非 GUI 宿主保持同步；GUI 宿主不得在调用线程读取——改动前断言失败） | ✅ 已修 |
 
 ## 3. 实测收益（`tools/quality/bench`）
 
@@ -36,7 +37,8 @@
 | 属性上限排除搜索（每轮） | 403 ms | **19.5 ms** | 复用已评分结果 |
 | 快照写入（600 件） | 209 ms | **185 ms** | `executemany` |
 | 装备详情曲线（53 属性） | 144 ms | **16 ms** | 每条曲线只读一次（1166 → 53 次查询） |
-| 配装目录重建（账号切换热点） | 1174 ms | 1174 ms | **未修**，见 N3 |
+| 配装目录重建：GUI 线程阻塞 | 1174 ms | **≈0 ms（转后台）** | 读取耗时本身不变，但不再阻塞界面 |
+| 原生会话关闭的 GUI 线程等待（最坏） | ≈6 s | **≈2 s** | HUD 超时 2.0→0.5、快照域 1.5→0.4；实例不可用时跳过 |
 
 ## 4. 已定位但未修复项（含原因）
 
@@ -44,7 +46,7 @@
 | --- | --- | --- | --- |
 | N1 | 正式库存指针可被「仅含本次变更 UID」的局部/按角色响应推进 | `src/services/warehouse_state_management.py:562-588`、`src/services/inventory_sync_service.py:572-597`；与 `begin_full_inventory_guard` 的全量冻结、稳定器注释（`inventory_snapshot_stabilizer.py:268-278`）冲突 | 严重度最高，但需改动同步状态机与稳定器交互，必须先有集成测试锁定「局部响应不得成为当前库存」，本轮时间不足以安全完成 |
 | N2 | 轴分页缺 `complete` 字段时默认判为已完成 | `battle_axis_dao.py:249,264` 用 `get("complete", True)`；`nte_core_battle.py:590` `default=True`；而 `battle_axis_finalization_dao.py:127,156` 用 `default=False` | 缺上游/实机证据证明 Core 是否总是发送该字段；直接改默认值可能影响分页终止条件，需实机核对后再动 |
-| N3 | 账号切换主线程同步重建目录 **1174 ms**（仍在）；`native_game_session.close()` 的同步 RPC 等待已缩短 | `src/ui/main_window_data_mixin.py:248-264`（同步）vs `:266-320`（WorkerThread）；`src/ui/app.py:741`；`native_game_session.py:502,470-480` | RPC 部分已修：HUD 超时 2.0→0.5、快照域 1.5→0.4，且连接实例不可用时直接跳过快照关闭 RPC（最坏约 6 s → 约 2 s）。目录重建**仍未异步化**：直接让 `_load_data` 委托 `_refresh_execute` 会无限递归（`_refresh_execute:273-275` 在非 QWidget 宿主反向调用 `_load_data`）；且 `app.py:764` 之后紧接 `_refresh_weighted_allocation()` 与 `account.switch_succeeded` 日志——异步化必须同时提供完成回调并把这两步挪到回调内，否则会出现「切换完成早于数据就绪」的越界宣称 |
+| N3 | 账号切换的 **主线程阻塞**已消除（F11），但目录重建本身仍是 1174 ms，只是搬到了后台线程 | 同 F11 | 后台读取仍需约 1.2 秒（一次重建 1414 条 SQL），期间执行页会短暂保持旧目录；若要缩短这段等待，需要处理 N4 的逐角色 N+1 |
 | N4 | N+1 查询放大（剩余） | `legacy_allocation_static_catalog.py:183-245,250-280`（一次重建 1414 条 SQL 的主因）、`weighted_shell.py:201-208`、`configuration/controller.py:163-193` | 需新增批量 DAO 接口并逐个回归，属结构性改动；`equipment_catalog_model.py` 的部分已在 F9 修复 |
 | N9 | 「清空配装」控制器路径缺少 Qt 层回归测试 | `equipment_display_controller.py` 的 `_clear_all_equipment` 依赖 `QMessageBox` | DAO 原子性已由 F10 的测试覆盖；控制器分支（失败提示、锁定跳过、`finally` 刷新）需 Qt 交互测试，本轮未补 |
 | N5 | 静态库共享连接跨线程 `execute` 无锁保护；`close_shared_connections()` 生产无调用点 | `static_game_data_dao.py` `check_same_thread=False`，锁只保护字典 | 需先确定调用是否跨线程并设计连接池，避免以锁换死锁 |
