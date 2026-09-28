@@ -711,6 +711,18 @@ class StaticGameDataDao(
     ) -> float | None:
         """按官方插值模式读取装备主属性在指定等级的数值。"""
 
+        return self.evaluate_equipment_base_attribute_curve_levels(
+            curve_id, (level,),
+        )[0]
+
+    def evaluate_equipment_base_attribute_curve_levels(
+        self,
+        curve_id: str,
+        levels: Iterable[float],
+    ) -> list[float | None]:
+        """一次读取曲线后求值多个等级，避免逐级重复查询同一条曲线。"""
+
+        requested = [float(level) for level in levels]
         curve = self._one(
             """
             SELECT interpolation_mode, default_value
@@ -720,7 +732,7 @@ class StaticGameDataDao(
             (str(curve_id),),
         )
         if curve is None:
-            return None
+            return [None] * len(requested)
         points = self._rows(
             """
             SELECT level, value
@@ -732,7 +744,22 @@ class StaticGameDataDao(
         )
         if not points:
             default_value = curve.get("default_value")
-            return None if default_value is None else float(default_value)
+            fallback = None if default_value is None else float(default_value)
+            return [fallback] * len(requested)
+
+        mode = str(curve.get("interpolation_mode") or "")
+        return [
+            self._interpolate_equipment_curve(mode, points, level)
+            for level in requested
+        ]
+
+    @staticmethod
+    def _interpolate_equipment_curve(
+        interpolation_mode: str,
+        points: list[dict[str, Any]],
+        level: float,
+    ) -> float:
+        """在一个已读取的曲线上按官方插值模式求值。"""
 
         target = float(level)
         if target <= float(points[0]["level"]):
@@ -746,7 +773,7 @@ class StaticGameDataDao(
             if target > current_level:
                 previous = current
                 continue
-            if str(curve.get("interpolation_mode") or "") == "RCIM_Constant":
+            if interpolation_mode == "RCIM_Constant":
                 return float(previous["value"])
             previous_level = float(previous["level"])
             span = current_level - previous_level
