@@ -28,6 +28,8 @@
 - F7 快照写入逐条 `execute`
 - F9 装备详情曲线按等级逐条查询，且物品缺失时抛未处理的 `StopIteration`
 - F17 原生会话关闭在 GUI 线程同步等待，最坏约 6 s
+- F18 逐角色各开一次账号库（一次重建 25 次），建连与迁移检查被按角色数放大
+- F19 弧盘模板投影每次重建都重算（51 个弧盘逐级的面板统计，约 0.95 s；纯 CPU，只随数据集发布变化）
 
 **资产与结构**
 - F12 角色头像存在两套查找路径（正式图鉴 + 遗留兼容查找）
@@ -57,6 +59,8 @@
 | F15 | action 回包替换当前库存前，要求覆盖当前完整库存的全部 UID，否则回落到状态投影 + 冻结守卫（允许额外行=更新的完整回包，但不得缺行；与稳定器既有守卫同向，那里为严格相等） | `tests/test_warehouse_state_management.py::test_scoped_packet_never_replaces_the_official_inventory`（改动前失败）；同步路径既有守卫由 `tests/test_inventory_snapshot_stabilizer.py` 覆盖 |
 | F16 | `run` 增加 `finally` 释放 scanner，与同文件既有实现一致 | `tests/test_scan_worker_lifecycle_boundaries.py`（改动前红） |
 | F17 | HUD 超时 2.0→0.5、快照域 1.5→0.4；实例不可用时跳过快照关闭 RPC | 参数级改动；既有会话测试通过 |
+| F18 | `load_official_role_detail` 新增可选 `user_dao`，目录重建复用同一个账号连接（只关闭自己打开的那个） | `tests/test_allocation_catalog_connection_boundaries.py`（改动前一次重建打开 **25** 次） |
+| F19 | `fork_templates_as_weapon_models` 按静态数据集身份缓存；数据集变化或 `clear_weapon_model_cache()` 后重算 | `tests/test_fork_weapon_model_cache.py`（3 条：命中缓存 / 数据集变化重算 / 清理后重算） |
 
 ## 影响
 
@@ -77,7 +81,7 @@
 | 属性上限排除搜索（每轮） | 403 ms | **19.5 ms** |
 | 快照写入（600 件） | 209 ms | **185 ms** |
 | 装备详情曲线（53 属性） | 144 ms | **16 ms** |
-| 配装目录重建 | 1174 ms（1417 条 SQL） | **1027 ms（887 条 SQL）** |
+| 配装目录重建 | 1174 ms（1417 条 SQL） | **663 ms（887 条 SQL）** |
 | 原生会话关闭的 GUI 线程等待（最坏） | ≈6 s | **≈2 s**（按超时参数估算，未实机计时） |
 
 ## 已定位但未修复
@@ -86,9 +90,9 @@
 | --- | --- | --- |
 | N2 | 轴分页缺 `complete` 字段时默认判为已完成（与最终化路径默认值相反） | 设备是否总会发送该字段属实机/上游协议证据；已固化当前判定并标注证据需求 |
 | N3 | 配装目录重建仍约 1.0 s（887 条 SQL），已从 GUI 线程移出 | 剩余耗时分布在三处（见 N4 与 N11），其中两处**不在**逐角色查询里 |
-| N4 | 逐角色详情的剩余查询（`load_official_role_detail`） | 实测占比：单次 `_read_allocation_catalog` 中 `build_legacy_allocation_static_catalog` ≈0.956 s，其中 `load_official_role_detail`（24 次）≈0.774 s（约 **81%**）、账号库重复打开 27 次 ≈0.510 s。目录只需弧盘投影，需要「只算投影」的入口，涉及默认档案解析 |
+| N4 | 逐角色详情的剩余查询（`load_official_role_detail`） | F18/F19 之后实测：一次重建（profiled）≈0.98 s，其中 `load_official_role_detail`（24 次）≈0.615 s，是剩余最大项。**价值**：做完约 663 ms → 300~400 ms、SQL 887 → 约 400，但之后它不再是最主要瓶颈。**风险**：① 默认档案解析依赖技能/觉醒/面板成长，另写一份投影入口容易语义漂移；② 角色页与目录投影变成两份真源，改一处漏一处会静默不一致；③ 数据不足时静默返回空投影，比现在抛错更难发现。**建议形态**：不新写入口，而是给 `load_official_role_detail` 加 `projection_only` 跳过与投影无关的部分，保留同一套档案解析与弧盘选择逻辑。**前置**：必须先有「全角色逐项对比新旧投影输出」的测试，没有就不做 |
 | N7 | 装备域完整性由背包域标志代替 | 需实机核对各域真实能力 |
-| N11 | 弧盘模板投影的纯 CPU 开销与账号库重复打开（**新发现**，量级不低于 N4） | cProfile：一次重建中 `fork_templates_as_weapon_models` ≈0.959 s（`_fork_stats_at_level` 4080 次、`fork_panel_stats` 4104 次、`_integer` **24.6 万次**、genexpr 8208 次），`list_fork_templates` 3 次 ≈0.364 s，`UserDataDao.__init__` 27 次 ≈0.510 s（含 `_migrate_schema` 0.348 s）。以上**不产生 SQL**，因此此前按 SQL 条数的统计看不到 | 本轮聚焦 N4 未动。按投入产出排序：**账号库复用（≈0.45 s，风险极低）> 弧盘投影缓存与 `_integer` 降频（≈0.9 s，纯 CPU、可逐项对比验证）> N4 投影模式（需逐角色输出对比测试）** |
+| N11 | `list_fork_templates` 在一次重建里被调用 3 次（≈0.366 s） | profiled：3 次 × ≈0.122 s。分别来自目录装配、`fork_templates_as_weapon_models` 的输入、角色详情（后者已被请求缓存合并为 1 次） | 未修：合并三者需要跨模块传递弧盘列表，或在 DAO 层按数据集缓存（返回可变列表，有被改写的风险）。收益约 0.24 s，性价比低于 N4 | | cProfile：一次重建中 `fork_templates_as_weapon_models` ≈0.959 s（`_fork_stats_at_level` 4080 次、`fork_panel_stats` 4104 次、`_integer` **24.6 万次**、genexpr 8208 次），`list_fork_templates` 3 次 ≈0.364 s，`UserDataDao.__init__` 27 次 ≈0.510 s（含 `_migrate_schema` 0.348 s）。以上**不产生 SQL**，因此此前按 SQL 条数的统计看不到 | 本轮聚焦 N4 未动。按投入产出排序：**账号库复用（≈0.45 s，风险极低）> 弧盘投影缓存与 `_integer` 降频（≈0.9 s，纯 CPU、可逐项对比验证）> N4 投影模式（需逐角色输出对比测试）** |
 | N9 | 「清空配装」控制器分支缺 Qt 层回归测试 | DAO 原子性已由 F10 覆盖；控制器交互需 Qt 测试 |
 | N10 | `_template_root_candidates` / `_TEMPLATE_ROOTS` 成为只写不读的死访问器 | `configure_warehouse_view_template_roots` 是组合根 API，简化需同时动 `app.py` |
 

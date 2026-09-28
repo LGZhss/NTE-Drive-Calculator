@@ -221,6 +221,7 @@ def build_legacy_allocation_static_catalog(
                             include_inventory_contexts=False,
                             static_database_path=static_dao.database_path,
                             request_cache=detail_cache,
+                            user_dao=user_dao,
                         )
                         calculation_projection = _current_role_calculation_projection(
                             detail,
