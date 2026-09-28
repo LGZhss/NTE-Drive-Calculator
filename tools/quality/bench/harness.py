@@ -11,7 +11,6 @@ import argparse
 import statistics
 import time
 from collections.abc import Callable
-from typing import Any
 
 
 def measure(
