@@ -26,6 +26,7 @@
 | F8 | `static_game_data_dao.py` 878 行超 800 行硬限 | 单一文件承载过多查询 | 拆出 `static_game_data_character_growth_queries.py`（878 → 680 行） | `tests/test_repository_hygiene.py` | ✅ 已修 |
 | F9 | 装备详情曲线按等级重复查询，且物品缺失时抛未处理的 `StopIteration` | `equipment_catalog_model.py` 原先每个等级各查一次曲线（53 属性 × 22 级 ≈ 1166 次），`next(...)` 无默认值 | DAO 新增 `evaluate_equipment_base_attribute_curve_levels`（一次读曲线、内存求值），`item_curves` 改为批量并返回空曲线 | `tests/test_static_catalog_equipment_page_ui.py` 新增 2 条（红：`StopIteration` + 读取次数 1166 ≠ 53） | ✅ 已修 |
 | F10 | 「清空配装」逐条写库、失败后不刷新界面 | `equipment_display_controller.py` 原先循环调用单条 `deactivate_loadout_plan`，中途失败留下部分已生效状态且跳过缓存失效；并用 `getattr(..., lambda: [])` 掩盖缺失方法 | DAO 新增 `deactivate_loadout_plans`（校验后单事务批量写入）；控制器改用它，并在 `finally` 中统一失效缓存与刷新 | `tests/test_loadout_plan_batch_deactivate_dao.py`（3 条：非法输入整体回滚、批量去重生效、空批次无副作用） | ✅ 已修 |
+| F12 | PR #64 新增的角色头像索引是死路径（`config/templates/roles` 在仓库与上游都不存在，恒返回空图） | `warehouse.py` 的 `_legacy_character_avatar` 依赖 `config/templates/roles`；实测对「早雾/灵可/零」全部返回空图；上游 API 查该目录返回 404 | 删除 `_role_avatar_index`、`_legacy_character_avatar` 及其回退调用；随之成为死代码的 `ROLE_AVATAR_ALIASES` / `normalize_role_avatar_name` 一并删除 | `tests/test_static_storage_perf.py`、`tests/test_warehouse_inventory.py` 中过时用例删除；`tests/test_static_storage_perf.py` 受影响 34 条测试通过 | ✅ 已修 |
 | F11 | 账号切换/启动在 GUI 线程同步重建配装目录 **1174 ms** | `_load_data` 原先同步执行 `_read_allocation_catalog`，而同一份逻辑在 `_refresh_execute` 里包在 WorkerThread（线程模型不一致）；直接委托会因 `_refresh_execute` 在非 QWidget 宿主反向调用 `_load_data` 而无限递归 | 抽出 `_read_and_apply_allocation_catalog` 与 `_start_allocation_catalog_worker`；`_load_data` 对 GUI 宿主走 worker 并支持完成回调；`app.py` 的收尾（页面刷新、`account.switch_succeeded` 日志）移入 mixin 的 `_finish_account_switch`，由回调在目录就绪后执行，避免「完成日志早于数据就绪」 | `tests/test_main_window_catalog_load_boundaries.py`（2 条：非 GUI 宿主保持同步；GUI 宿主不得在调用线程读取——改动前断言失败） | ✅ 已修 |
 
 ## 3. 实测收益（`tools/quality/bench`）
@@ -52,7 +53,8 @@
 | N5 | 静态库共享连接跨线程 `execute` 无锁保护；`close_shared_connections()` 生产无调用点 | `static_game_data_dao.py` `check_same_thread=False`，锁只保护字典 | 需先确定调用是否跨线程并设计连接池，避免以锁换死锁 |
 | N6 | `ScanWorkerThread.run` 无 `finally` 释放 scanner；退出时主线程 `worker.wait(5000)`×3 | `src/app/workers.py:64-79`（对比 `:258-259` 有释放）、`scanning/controller.py:230-235` | 依赖真实 QThread 与 Qt 事件循环，无法用纯 Python 单测稳定复现 |
 | N7 | 装备域完整性由背包域标志代替；能力不足时沿用遗留 ready 布尔 | `work_mode_runtime.py:710-716`、`native_inventory_lease.py:77-95,135` | 属工作模式与原生能力判定，需实机核对各域真实能力 |
-| N8 | 角色头像索引路径为死路径 | 仓库与上游 `config/templates/roles` **均不存在**（上游 API 返回 404）；全仓无 `roles` 目录 → `_legacy_character_avatar` 恒返回空 | 不删除：该路径可由运行期模板根目录配置复活，删除会移除用户自定义能力；仅记录，PR #64 的头像收益在默认发行下为 0 |
+| N8 | 角色头像索引路径为死路径 → **已在 F12 中删除** | 仓库与上游 `config/templates/roles` **均不存在**（上游 API 返回 404）；全仓无 `roles` 目录 → `_legacy_character_avatar` 恒返回空 | 见 F12：已按用户确认删除该路径（原顾虑是可由运行期模板根目录配置复活，用户判断该能力无实际使用者） |
+| N10 | `warehouse.py` 的 `_template_root_candidates` / `_TEMPLATE_ROOTS` 在 F12 后成为只写不读的死访问器 | 头像路径删除后无人调用 | 保留：`configure_warehouse_view_template_roots` 是组合根 API（`app.py:147-153` 调用），简化或改名需要同时动 `app.py`，留待确认这是否算废弃入口 |
 
 ## 5. 验证结果
 
