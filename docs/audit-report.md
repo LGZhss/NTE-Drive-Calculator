@@ -31,7 +31,10 @@
 
 **资产与结构**
 - F12 角色头像存在两套查找路径（正式图鉴 + 遗留兼容查找）
-- F8 `static_game_data_dao.py` 超过 800 行硬限
+- F8 `static_game_data_dao.py` 违反可评审性契约（`AGENTS.md` §7：`src/`、`tools/`、`tests/` 下
+  新增或修改的 `.py` 不超过 800 行，触及超限存量只拆分或收缩）。审计时该文件 878 行，
+  `tests/test_repository_hygiene.py::test_python_modules_stay_within_review_threshold` 失败。
+  属门禁/可维护性项，**不是运行缺陷**
 
 ## 改动
 
@@ -44,7 +47,7 @@
 | F5 | 评分角色级预计算 + 名称归一化缓存；属性上限搜索复用首轮结果（`reuse_scores`） | `tests/test_allocation_kernel_property_limits.py`（4 条，改动前 `1 != 2`） |
 | F6 | `_is_temp_path` 去二次 `Path.resolve()` 并缓存临时目录判定 | `tests/test_static_storage_perf.py` |
 | F7 | 快照写入改分组 `executemany`（写入顺序与事务边界不变） | 既有快照测试 |
-| F8 | 拆出 `static_game_data_character_growth_queries.py` 与 `static_game_data_weight_queries.py`（878 → 756 行） | `tests/test_repository_hygiene.py` |
+| F8 | 拆出 `static_game_data_character_growth_queries.py` 与 `static_game_data_weight_queries.py`（878 → 756 行，满足 `AGENTS.md` §7 的 800 行可评审性契约） | `tests/test_repository_hygiene.py` |
 | F9 | DAO 新增 `evaluate_equipment_base_attribute_curve_levels`（一次读曲线、内存求值），`item_curves` 批量化并返回空曲线 | `tests/test_static_catalog_equipment_page_ui.py`（2 条，改动前红） |
 | F10 | DAO 新增 `deactivate_loadout_plans`（校验后单事务批量），控制器改用并在 `finally` 统一失效缓存与刷新 | `tests/test_loadout_plan_batch_deactivate_dao.py`（3 条） |
 | F11 | 抽出 `_read_and_apply_allocation_catalog` / `_start_allocation_catalog_worker`；GUI 宿主走 worker 并支持完成回调；`app.py` 收尾移入 `_finish_account_switch` | `tests/test_main_window_catalog_load_boundaries.py`（2 条，改动前红） |
@@ -97,3 +100,7 @@
 | `mypy` | 既有报错不变，无新增（改动文件逐个 A/B 对比） |
 | `tools/quality/bench` | 场景稳定输出，见实测收益表 |
 | `run_tests.py full` | 早前运行 3043 条、1 个 error（`test_static_data_manifest` 缺 `dist` 中 OCR 模型，既有环境问题）；当前提交未重跑 |
+
+行数口径提醒：`test_repository_hygiene` 用 `len(Path.read_text().splitlines())` 计行；PowerShell
+的 `Get-Content | Measure-Object -Line` 会给出明显偏小的结果（本机同一文件 891 vs 798），
+判断 800 行契约时**不要用后者**。
