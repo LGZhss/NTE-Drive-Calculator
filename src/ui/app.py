@@ -582,6 +582,12 @@ class MainWindow(MainWindowThemeMixin, MainWindowNavigationMixin, MainWindowData
             except Exception:
                 pass
             self._qt_log_sink_id = None
+        # 进程退出前回收静态库共享只读连接；该入口此前在生产代码里没有调用点，
+        # 连接会一直留到解释器结束。
+        try:
+            StaticGameDataDao.close_shared_connections()
+        except Exception as exc:
+            logger.warning(f"关闭静态库共享连接失败: {exc}")
         super().closeEvent(e)
 
     def _tb_press(self, e):

@@ -30,6 +30,10 @@ _ROLE_TEMPLATE_CLASSIFICATIONS = {
 
 _SHARED_STATIC_CONNECTIONS: dict[str, sqlite3.Connection] = {}
 _SHARED_STATIC_LOCK = threading.Lock()
+# SQLite 以 serialized 模式编译（``sqlite3.threadsafety == 3``），并发 execute
+# 本身是安全的；这把锁隔离的是「执行中」与「关闭连接」，避免查询线程拿到已关闭
+# 的连接，并让进程退出时的回收与正在进行的读互不干扰。
+_SHARED_STATIC_EXECUTE_LOCK = threading.RLock()
 
 
 @lru_cache(maxsize=4)
@@ -264,38 +268,54 @@ class StaticGameDataDao(
             self._connection = None
             return
         norm_key = os.path.normcase(str(self.database_path))
-        with _SHARED_STATIC_LOCK:
-            _SHARED_STATIC_CONNECTIONS.pop(norm_key, None)
-        try:
-            connection.close()
-        except sqlite3.Error:
-            pass
+        with _SHARED_STATIC_EXECUTE_LOCK:
+            with _SHARED_STATIC_LOCK:
+                _SHARED_STATIC_CONNECTIONS.pop(norm_key, None)
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
         self._connection = None
 
     @classmethod
     def close_shared_connections(cls, database_path: str | Path | None = None) -> None:
         """Close shared static database connections across the process."""
-        with _SHARED_STATIC_LOCK:
-            if database_path is not None:
-                norm_key = os.path.normcase(str(Path(database_path).expanduser().resolve()))
-                conn = _SHARED_STATIC_CONNECTIONS.pop(norm_key, None)
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except sqlite3.Error:
-                        pass
-            else:
-                for conn in _SHARED_STATIC_CONNECTIONS.values():
-                    try:
-                        conn.close()
-                    except sqlite3.Error:
-                        pass
-                _SHARED_STATIC_CONNECTIONS.clear()
+        with _SHARED_STATIC_EXECUTE_LOCK:
+            with _SHARED_STATIC_LOCK:
+                if database_path is not None:
+                    norm_key = os.path.normcase(
+                        str(Path(database_path).expanduser().resolve())
+                    )
+                    conn = _SHARED_STATIC_CONNECTIONS.pop(norm_key, None)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except sqlite3.Error:
+                            pass
+                else:
+                    for conn in _SHARED_STATIC_CONNECTIONS.values():
+                        try:
+                            conn.close()
+                        except sqlite3.Error:
+                            pass
+                    _SHARED_STATIC_CONNECTIONS.clear()
 
     def _rows(self, sql: str, parameters: Iterable[Any] = ()) -> list[dict[str, Any]]:
-        if self._connection is None:
-            raise StaticGameDataError("静态数据库 DAO 已关闭")
-        return [dict(row) for row in self._connection.execute(sql, tuple(parameters))]
+        with _SHARED_STATIC_EXECUTE_LOCK:
+            connection = self._connection
+            if connection is None:
+                raise StaticGameDataError("静态数据库 DAO 已关闭")
+            try:
+                return [
+                    dict(row)
+                    for row in connection.execute(sql, tuple(parameters))
+                ]
+            except sqlite3.ProgrammingError as exc:
+                # 共享连接可能已被其他线程 close(force=True) 或进程回收关闭；
+                # 转换成领域错误，避免工作线程拿到裸露的 sqlite3 异常。
+                if "closed" not in str(exc).lower():
+                    raise
+                raise StaticGameDataError("静态数据库 DAO 已关闭") from exc
 
     def _one(self, sql: str, parameters: Iterable[Any] = ()) -> dict[str, Any] | None:
         rows = self._rows(sql, parameters)
