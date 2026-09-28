@@ -13,6 +13,7 @@ from typing import Any, Iterable, NoReturn
 
 import tempfile
 import threading
+from functools import lru_cache
 from src.domain.recommended_weights import workshop_weight_source_ids
 from .static_game_data_metadata import (
     MINIMUM_SUPPORTED_SCHEMA_VERSION,
@@ -32,17 +33,26 @@ _SHARED_STATIC_CONNECTIONS: dict[str, sqlite3.Connection] = {}
 _SHARED_STATIC_LOCK = threading.Lock()
 
 
+@lru_cache(maxsize=4)
+def _resolved_temp_dir() -> Path:
+    """Cache the temp root; it does not change within a process."""
+
+    return Path(tempfile.gettempdir()).resolve()
+
+
+@lru_cache(maxsize=256)
 def _is_temp_path(path: Path) -> bool:
-    """Check if the given path resides within temporary directories."""
+    """Check whether an already-resolved path resides in temp directories.
+
+    ``StaticGameDataDao`` 传入的路径已由 ``resolve_static_database`` 解析过；
+    这里不再二次解析。Windows 上每次 ``Path.resolve()`` 都要逐个路径段调用
+    ``GetFinalPathName``，是短生命周期开连的主要开销。
+    """
     try:
-        resolved = path.resolve()
-        temp_dir = Path(tempfile.gettempdir()).resolve()
-        if temp_dir in resolved.parents:
-            return True
-        parts = {p.lower() for p in resolved.parts}
+        parts = {part.lower() for part in path.parts}
         if parts & {"tmp", "temp", ".tmp", "pytest"}:
             return True
-        return False
+        return _resolved_temp_dir() in path.parents
     except Exception:
         return False
 
@@ -130,6 +140,9 @@ from src.storage.sqlite.static_game_data_terminology_queries import (
 from src.storage.sqlite.static_game_data_progression_queries import (
     StaticGameDataProgressionQueriesMixin,
 )
+from src.storage.sqlite.static_game_data_character_growth_queries import (
+    StaticGameDataCharacterGrowthQueriesMixin,
+)
 from src.storage.sqlite.static_game_data_skill_damage_queries import (
     StaticGameDataSkillDamageQueriesMixin,
 )
@@ -137,6 +150,7 @@ from src.storage.sqlite.static_game_data_skill_damage_queries import (
 
 class StaticGameDataDao(
     StaticGameDataProgressionQueriesMixin,
+    StaticGameDataCharacterGrowthQueriesMixin,
     StaticGameDataTerminologyQueriesMixin,
     StaticGameDataEncounterQueriesMixin,
     StaticGameDataBuffQueriesMixin,
@@ -555,139 +569,6 @@ class StaticGameDataDao(
                 )
             ) is not None
         ]
-
-    def list_character_awaken_effects(self, character_id: int) -> list[dict[str, Any]]:
-        """返回角色六觉与三/六觉共鸣，含可直接应用的技能等级加成。"""
-
-        effects = self._rows(
-            """
-            SELECT character_id, effect_id, ordinal, awaken_type, title_zh,
-                   title_text_table, title_text_key, description_zh,
-                   description_text_table, description_text_key, icon_path,
-                   modify_data_json, gameplay_effect_ids_json, source_row_id
-            FROM character_awaken_effect
-            WHERE character_id = ?
-            ORDER BY ordinal
-            """,
-            (character_id,),
-        )
-        bonuses_by_effect: dict[str, list[dict[str, Any]]] = {}
-        for bonus in self._rows(
-            """
-            SELECT effect_id, ordinal, skill_id, level_delta
-            FROM character_awaken_skill_level_bonus
-            WHERE character_id = ?
-            ORDER BY effect_id, ordinal
-            """,
-            (character_id,),
-        ):
-            effect_id = bonus.pop("effect_id")
-            bonuses_by_effect.setdefault(effect_id, []).append(bonus)
-        for effect in effects:
-            effect["modify_data"] = json.loads(effect.pop("modify_data_json"))
-            effect["gameplay_effect_ids"] = json.loads(effect.pop("gameplay_effect_ids_json"))
-            effect["skill_level_bonuses"] = bonuses_by_effect.get(effect["effect_id"], [])
-            effect["description_damage_entries"] = [
-                damage
-                for damage_id in effect["gameplay_effect_ids"]
-                if (damage := self.get_skill_damage(str(damage_id))) is not None
-            ]
-        return effects
-
-    def get_character_panel_growth(
-        self, character_id: int, level: int, breakthrough_stage: int
-    ) -> dict[str, Any] | None:
-        """按角色、等级和已突破阶段返回官方基础生命、攻击和防御。"""
-
-        return self._one(
-            """
-            SELECT character_id, level, breakthrough_stage, state,
-                   hp_base, atk_base, def_base,
-                   player_pack_source_row_id, level_modify_source_row_id,
-                   breakthrough_modify_source_row_id
-            FROM character_panel_growth
-            WHERE character_id = ? AND level = ? AND breakthrough_stage = ?
-            """,
-            (character_id, level, breakthrough_stage),
-        )
-
-    def list_character_panel_growth(self, character_id: int) -> list[dict[str, Any]]:
-        """返回角色全部官方等级/突破面板，供角色页选择而非复制数值。"""
-
-        return self._rows(
-            """
-            SELECT character_id, level, breakthrough_stage, state,
-                   hp_base, atk_base, def_base,
-                   player_pack_source_row_id, level_modify_source_row_id,
-                   breakthrough_modify_source_row_id
-            FROM character_panel_growth
-            WHERE character_id = ?
-            ORDER BY level, breakthrough_stage
-            """,
-            (character_id,),
-        )
-
-    def list_character_skills(self, character_id: int) -> list[dict[str, Any]]:
-        """返回角色技能目录及每一级对应的突破、觉醒和材料要求。"""
-
-        skills = self._rows(
-            """
-            SELECT character_id, skill_id, ability_type, ability_index,
-                   show_detail_info, gameplay_tag, gameplay_effect_path,
-                   reapply_after_revive, ability_source_row_id, effect_source_row_id
-            FROM character_skill
-            WHERE character_id = ?
-            ORDER BY ability_index, skill_id
-            """,
-            (character_id,),
-        )
-        levels_by_skill: dict[str, list[dict[str, Any]]] = {}
-        for level in self._rows(
-            """
-            SELECT skill_id, level, required_breakthrough_stage,
-                   required_awaken_level, cost_items_json
-            FROM character_skill_level
-            WHERE character_id = ?
-            ORDER BY skill_id, level
-            """,
-            (character_id,),
-        ):
-            skill_id = level.pop("skill_id")
-            level["cost_items"] = json.loads(level.pop("cost_items_json"))
-            levels_by_skill.setdefault(skill_id, []).append(level)
-        for skill in skills:
-            skill["show_detail_info"] = bool(skill["show_detail_info"])
-            skill["reapply_after_revive"] = bool(skill["reapply_after_revive"])
-            skill["levels"] = levels_by_skill.get(skill["skill_id"], [])
-            skill["damage_entries"] = self._rows(
-                """
-                SELECT d.damage_id, d.damage_type, d.charge_add, d.unbal_value,
-                       d.heterochrome_add, d.damage_source_category, d.fixed_crit_rate,
-                       d.atk_rate_base_json, d.def_rate_base_json, d.hp_rate_base_json,
-                       d.story_balance_ge_rate, d.attack_break_level,
-                       d.override_breakable_damage, d.breakable_damage,
-                       d.override_breakable_impulse, d.breakable_impulse,
-                       d.override_vehicle_breakable_impulse,
-                       d.vehicle_breakable_impulse, d.source_row_id,
-                       m.atk_rate_base_coefficient AS modifier_atk_rate_base_coefficient,
-                       m.source_row_id AS modifier_source_row_id
-                FROM skill_damage AS d
-                LEFT JOIN skill_damage_modifier AS m USING (damage_id)
-                WHERE d.ability_id = ?
-                ORDER BY d.damage_id
-                """,
-                (skill["skill_id"],),
-            )
-            for damage in skill["damage_entries"]:
-                for key in ("atk_rate_base", "def_rate_base", "hp_rate_base"):
-                    damage[key] = json.loads(damage.pop(f"{key}_json"))
-                for key in (
-                    "override_breakable_damage",
-                    "override_breakable_impulse",
-                    "override_vehicle_breakable_impulse",
-                ):
-                    damage[key] = bool(damage[key])
-        return skills
 
     def list_shapes(self) -> list[dict[str, Any]]:
         shapes = self._rows(

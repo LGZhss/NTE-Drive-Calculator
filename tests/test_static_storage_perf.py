@@ -1,7 +1,6 @@
 # 测试静态数据库连接复用、PRAGMA 优化与资产缓存。
 """Unit tests verifying SQLite static DB connection reuse, PRAGMAs, and asset caching."""
 
-import sqlite3
 import tempfile
 import threading
 import unittest
