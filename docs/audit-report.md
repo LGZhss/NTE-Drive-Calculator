@@ -49,7 +49,7 @@
 | # | 问题 | 证据 | 未修原因 |
 | --- | --- | --- | --- |
 | N1 | 正式库存指针可被「仅含本次变更 UID」的局部/按角色响应推进 → **已在 F15 中修复** | 见 F15 | 已收口为「覆盖当前完整库存才允许替换」；仍缺实机证据说明设备是否会给局部回包标记 `complete`（与 N2 同类举证问题） |
-| N2 | 轴分页缺 `complete` 字段时默认判为已完成 | `battle_axis_dao.py:249,264` 用 `get("complete", True)`；`nte_core_battle.py:590` `default=True`；而 `battle_axis_finalization_dao.py:127,156` 用 `default=False` | 缺上游/实机证据证明 Core 是否总是发送该字段；直接改默认值可能影响分页终止条件，需实机核对后再动 |
+| N2 | 轴分页缺 `complete` 字段时默认判为已完成（与最终化路径默认值相反） | 分页终止条件的实际决策点是 `integrations/nte_core_battle.parse_battle_axis`（`default=True`）；`storage/sqlite/battle_axis_dao.py:249,264` 同为 True；而 `battle_axis_finalization_dao.py:127,156` 用 False、`battle_capture_service.py:586` 缺省视为未完成。下游消费者拿到的都是解析后的页面，因此该分歧目前只在绕过解析层时才会显现 | 未改行为：设备是否总会发送该字段属实机/上游协议证据。已在解析点写明分歧与证据需求，并新增 `tests/test_battle_axis_complete_defaults.py` 固化当前判定，后续统一默认值会直接体现为测试差异 |
 | N3 | 配装目录重建仍约 1.0 s（一次重建 887 条 SQL），已从 GUI 线程移出但耗时未降到底 | 同 F11/F13 | 后台读取期间执行页会短暂保持旧目录；剩余耗时集中在 `load_official_role_detail` 的逐角色详情（约 500 条 SQL，见 N4） |
 | N4 | N+1 查询放大（剩余部分） | `official_role_page_service.load_official_role_detail` 被配装目录按角色调用（技能、觉醒、图纸、推荐权重等，约 500 条 SQL）；`weighted_shell.py:201-208` 仍有逐角色项 | 目录只需弧盘投影，需要一个「只算投影」的批量入口，涉及默认档案解析；F13 已消除其余放大项 |
 | N9 | 「清空配装」控制器路径缺少 Qt 层回归测试 | `equipment_display_controller.py` 的 `_clear_all_equipment` 依赖 `QMessageBox` | DAO 原子性已由 F10 的测试覆盖；控制器分支（失败提示、锁定跳过、`finally` 刷新）需 Qt 交互测试，本轮未补 |
