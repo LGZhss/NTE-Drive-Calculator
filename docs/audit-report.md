@@ -1,108 +1,99 @@
-# 深度审计与修复报告（2026-09-28）
+# 审计与修复报告（2026-09-28）
 
-本报告记录一次自主深度审计的结构化结果：问题、根因、修复与验证状态。所有改动仅发生在
-独立副本 `_repo-perf` 的分支上，未触碰 `_repo` 的 `main`。对专有协议与二进制只做只读检查，
-未修改、打补丁或注入任何外部二进制与游戏程序。
+分支 `perf/snapshot-write-and-indexes`（fork），PR #65 **基准为上游 `test` 分支**，当前为草稿、未合并。
+全部改动位于独立副本 `_repo-perf`；`_repo` 的 `main`、`deploy.ps1`、`deploy_to_program_files.bat` 未触碰。
+未修改、打补丁或注入任何外部二进制、游戏程序或组件包；`third_party` 相关内容仅用于只读核对。
 
-## 1. 方法与证据标准
+## 问题
 
-- 四条并行审计链路（子代理）：主线程卡顿与账号切换、协议与兼容性、并发-取消-代次与泄漏、
-  边界与错误处理；另用 `gh` 核实上游事实。
-- 每个修复先写能复现缺陷的公共行为测试并确认「改动前失败」，再改生产代码（红 → 绿）；
-  必要时用 `git stash` 做改动前后 A/B。
-- 性能结论统一用 `tools/quality/bench`（预热 + 多轮 + 中位/最小）产生，单次运行不作为依据。
+**稳定性**
+- F1 测试进程可被非 GUI 的 Qt 应用实例污染：后续控件在缺少 `QGuiApplication` 时被创建，Qt 致命退出
+  （`0xC0000409`），整个测试进程被杀，分片无汇总输出且退出码非 0。最小复现：两个模块同进程
+- F2 迁移产生外键违规后既无法回滚也被跳过：校验在 `commit()` 之后，违规数据已落库、版本已推进
+- F3 账号切换可能半途失败：`stop()` 抛 `TimeoutError` 会中断整条切换，账号索引已持久化但内存代次未推进
+- F4 过期扫描结果仍会搬移截图并删除临时目录（代次复核在提交之后）
+- F16 `ScanWorkerThread.run` 失败或取消时不释放 scanner，泄漏虚拟手柄与句柄
 
-## 2. 已修复项
+**数据一致性**
+- F15 局部/按角色响应可推进正式库存指针：action 回包只要求覆盖「本次变更目标」即被导入，
+  而背包导入仅校验 `complete` 标志，其余装备会从当前库存消失
+- F10 「清空配装」逐条写库，中途失败留下部分已生效状态且不刷新界面
+- F14 静态库共享连接跨线程无保护、退出时不回收：残留句柄抛裸 `sqlite3.ProgrammingError`
 
-| # | 问题 | 根因（证据） | 修复 | 回归测试 | 状态 |
-| --- | --- | --- | --- | --- | --- |
-| F1 | 测试进程可被非 GUI 的 Qt 应用实例污染，导致 Qt 致命退出（`0xC0000409`）——表现为分片无汇总输出且非 0 退出 | `tests/test_battle_report_analysis_load_service.py` 曾创建**非 GUI** 的 `QCoreApplication`；同进程后续 `test_role_catalog.py:38` 的 `QApplication.instance()` 直接返回它，控件在缺少 `QGuiApplication` 时被创建 → Qt 致命退出。最小复现：两模块同进程 | 新增 `tests/qt_application_fixture.py` 提供进程级唯一 GUI 应用；该测试改用它 | `tests/test_qt_application_isolation_boundaries.py`（2 条：禁止自建非 GUI 实例、同进程组合必须成功） | ✅ 已修 |
-| F2 | 迁移产生外键违规后既无法回滚也被跳过 | `src/storage/sqlite/user_data_base.py` 原先在 `commit()` **之后**才 `PRAGMA foreign_key_check`，违规时事务已落库且 `schema_migration` 已写目标版本 | 校验移入事务内、提交之前 | `tests/test_user_data_migration_foreign_key_rollback.py`（红：`43 != 44`） | ✅ 已修 |
-| F3 | 账号切换可能半途失败：账号索引已持久化但内存代次未推进 | `src/app/context.py` 的 stop/rebuild/notify/start 无逐项隔离；`stop()` 抛 `TimeoutError`（`inventory_sync_service.py:757-759`）会中断整条切换 | 新增 `_run_switch_step`，逐步隔离并记录告警 | `tests/test_app_context.py` 新增 3 条（停止失败、回调失败、重建失败） | ✅ 已修 |
-| F4 | 过期扫描结果仍会搬移截图并删除临时目录 | `src/services/streaming_scan_service.py` 原先只在解析前与提交**后**复核代次，`commit()` 的副作用不可回退 | 提交前置复核，并抽出 `_is_stale_result` / `_stale_scan_stats` 去重 | `tests/test_streaming_scan_commit_boundaries.py`（红：`True is not false`） | ✅ 已修 |
-| F5 | 评分与配装内核存在重复计算 | 角色级 `max_theoretical_weight` 在「装备 × 角色」内层重算；名称归一化每次重建别名字典；属性上下限搜索重复首轮且最多 256 轮重跑全量评分 | 角色级预计算 + 名称归一化缓存；搜索复用首轮结果并新增 `reuse_scores` | `tests/test_allocation_kernel_property_limits.py`（4 条，改动前 `1 != 2` 失败） | ✅ 已修 |
-| F6 | 静态库短生命周期开连开销偏高 | 每次开连重复 `Path.resolve()`（Windows 走逐段 `GetFinalPathName`） | `_is_temp_path` 去二次解析并缓存 | `tests/test_static_storage_perf.py` | ✅ 已修 |
-| F7 | 快照写入逐条 `execute` | 完整背包产生「装备数 + 词条数 + 角色数」次调用 | 分组 `executemany`（顺序与事务边界不变） | 既有快照测试 | ✅ 已修 |
-| F8 | `static_game_data_dao.py` 878 行超 800 行硬限 | 单一文件承载过多查询 | 拆出 `static_game_data_character_growth_queries.py`（878 → 680 行） | `tests/test_repository_hygiene.py` | ✅ 已修 |
-| F9 | 装备详情曲线按等级重复查询，且物品缺失时抛未处理的 `StopIteration` | `equipment_catalog_model.py` 原先每个等级各查一次曲线（53 属性 × 22 级 ≈ 1166 次），`next(...)` 无默认值 | DAO 新增 `evaluate_equipment_base_attribute_curve_levels`（一次读曲线、内存求值），`item_curves` 改为批量并返回空曲线 | `tests/test_static_catalog_equipment_page_ui.py` 新增 2 条（红：`StopIteration` + 读取次数 1166 ≠ 53） | ✅ 已修 |
-| F10 | 「清空配装」逐条写库、失败后不刷新界面 | `equipment_display_controller.py` 原先循环调用单条 `deactivate_loadout_plan`，中途失败留下部分已生效状态且跳过缓存失效；并用 `getattr(..., lambda: [])` 掩盖缺失方法 | DAO 新增 `deactivate_loadout_plans`（校验后单事务批量写入）；控制器改用它，并在 `finally` 中统一失效缓存与刷新 | `tests/test_loadout_plan_batch_deactivate_dao.py`（3 条：非法输入整体回滚、批量去重生效、空批次无副作用） | ✅ 已修 |
-| F11 | 账号切换/启动在 GUI 线程同步重建配装目录 **1174 ms** | `_load_data` 原先同步执行 `_read_allocation_catalog`，而同一份逻辑在 `_refresh_execute` 里包在 WorkerThread（线程模型不一致）；直接委托会因 `_refresh_execute` 在非 QWidget 宿主反向调用 `_load_data` 而无限递归 | 抽出 `_read_and_apply_allocation_catalog` 与 `_start_allocation_catalog_worker`；`_load_data` 对 GUI 宿主走 worker 并支持完成回调；`app.py` 的收尾（页面刷新、`account.switch_succeeded` 日志）移入 mixin 的 `_finish_account_switch`，由回调在目录就绪后执行，避免「完成日志早于数据就绪」 | `tests/test_main_window_catalog_load_boundaries.py`（2 条：非 GUI 宿主保持同步；GUI 宿主不得在调用线程读取——改动前断言失败） | ✅ 已修 |
-| F12 | 角色头像存在两套查找路径（正式图鉴 + `config/templates/roles` 遗留兼容查找） | `warehouse.py` 的 `_legacy_character_avatar` 只服务遗留兼容查找，`_role_avatar_index` 是为它新增的目录索引 | 经裁定该遗留查找已无实际使用者，显式移除：`_role_avatar_index`、`_legacy_character_avatar`、`ROLE_AVATAR_ALIASES`、`normalize_role_avatar_name` 与回退调用一并删除，头像统一取 `equipped_character_icon_path` | `tests/test_static_storage_perf.py`、`tests/test_warehouse_inventory.py` 中过时用例删除；受影响测试通过 | ✅ 已修 |
-| F13 | 配装目录重建的逐角色 N+1（实测 1417 条 SQL、中位 1174 ms） | `legacy_allocation_static_catalog.py` 逐角色 `get_equipment_plan`（5 条/次）、`get_character_default_suit`、`get_effective_character_shape_bonus`（2 条）、好感度加成（3 条）；`ScoringEngine._load_roles_from_sqlite` 逐角色读账号权重与推荐权重；`project_equipment_items_to_max_level` 空列表下仍整表读装备；`StaticGameDataDao.summary()` 逐表 COUNT（约 115 条） | 新增批量 DAO：`list_character_shape_bonuses`、`list_character_default_suits`、`list_character_likeability_bonuses`、`map_character_recommended_weights`、`list_character_weight_preferences`、`dataset_info`；图纸改用既有 `list_equipment_plans`；空输入短路；`load_official_role_detail` 的目录作用域与账号设置副本按请求缓存（另曾把 `summary()` 的逐表 COUNT 合并为单条多子查询，实测对本次收益无贡献，已回退以缩小改动面） | 实测 **1417 → 887 条 SQL（−37%）**、中位 **1174 → 1027 ms**；67 条相关测试通过、mypy 无新增 | ✅ 已修 |
-| F14 | 静态库共享连接跨线程无保护，且退出时不回收 | 连接以 `check_same_thread=False` 跨线程复用，Python 侧只保护注册表字典；`close(force=True)` 或进程回收关闭后，残留句柄的查询会抛出裸 `sqlite3.ProgrammingError`；`close_shared_connections()` 在生产代码里没有调用点 | `_rows` 与 `close()`/`close_shared_connections()` 共用 `_SHARED_STATIC_EXECUTE_LOCK` 互斥（SQLite 属 serialized 模式，故不引入连接池）；「连接已关闭」统一转为 `StaticGameDataError`；`MainWindow.closeEvent` 退出时回收共享连接 | `tests/test_static_connection_lifecycle_boundaries.py`（3 条；改动前 1 失败 1 报错） | ✅ 已修 |
-| F15 | 局部/按角色响应可能推进正式库存指针（原 N1） | 逐入口核对：同步路径**早已有守卫**（`inventory_snapshot_stabilizer.offer(required_uids=…)` 在 `uids != required_uids` 时返回 `ignored/inventory_guard_mismatch`，`inventory_sync_runtime.py:268,301` 在冻结会话中传入冻结集合）；视觉扫描由构造保证为全量枚举（`vision_inventory_snapshot.build_vision_snapshot` 固定 `complete: True` + 全量 items）；DAO 最后一道只校验 `complete is not True`。**唯一例外**是 `warehouse_state_management._replace_with_action_snapshot`：只要求 packet 覆盖「本次变更目标」就导入，于是「声明 complete、却只含变更 UID」的局部回包会替换正式库存，其余装备从当前库存消失；既有测试 `test_one_key_management_replaces_inventory_when_one_packet_covers_all_targets` 正是该形状，而 `apply` 里的注释本已声明「局部响应应被忽略而不是导入为当前库存」 | 替换前要求 packet 覆盖当前完整库存的全部 UID，否则返回 None 并回落到状态投影 + 冻结守卫（不改 DAO 的 `complete` 语义；允许额外行=更新的完整回包，但不得缺行） | `tests/test_warehouse_state_management.py::test_scoped_packet_never_replaces_the_official_inventory`（改动前失败）；同步路径既有守卫由 `tests/test_inventory_snapshot_stabilizer.py::test_fast_apply_guard_rejects_scoped_snapshot_without_historical_count_rule` 覆盖 | ✅ 已修 |
-| F16 | `ScanWorkerThread.run` 失败或取消时未释放 scanner（原 N6） | `src/app/workers.py:64-79` 的 `run` 没有 `finally` 释放扫描器资源（同文件 `:258-259` 的 `FullVisualScanParseWorkerThread` 已释放），异常或取消路径会泄漏虚拟手柄与句柄 | `run` 增加 `finally` 释放，与同文件既有实现保持一致 | `tests/test_scan_worker_lifecycle_boundaries.py`（改动前断言失败） | ✅ 已修 |
-| F17 | 原生会话关闭在 GUI 线程同步等待，最坏约 6 s | `src/services/native_game_session.py` 的 `close()` 在 GUI 线程等待 HUD 与快照关闭 RPC；连接实例已不可用时仍逐个域等到超时 | HUD 超时 2.0→0.5、快照域 1.5→0.4；实例不可用时跳过快照关闭 RPC（连接关闭本身会由对端回收 HUD 与快照） | 参数级改动：最坏等待由超时参数估算约 2 s，**未实机计时**；既有会话测试通过 | ✅ 已修 |
+**性能**
+- F11 账号切换/启动在 GUI 线程同步重建配装目录（中位 1174 ms）——「经常未响应」的主因
+- F13 配装目录重建逐角色 N+1（一次重建 1417 条 SQL）
+- F5 评分与配装内核重复计算：属性上下限搜索最坏 256 轮全量重评
+- F6 静态库短生命周期开连重复做 Windows 路径解析
+- F7 快照写入逐条 `execute`
+- F9 装备详情曲线按等级逐条查询，且物品缺失时抛未处理的 `StopIteration`
+- F17 原生会话关闭在 GUI 线程同步等待，最坏约 6 s
 
-## 3. 实测收益（`tools/quality/bench`）
+**资产与结构**
+- F12 角色头像存在两套查找路径（正式图鉴 + 遗留兼容查找）
+- F8 `static_game_data_dao.py` 超过 800 行硬限
 
-| 场景 | 修复前 | 当前 | 说明 |
-| --- | --- | --- | --- |
-| 静态库开连（含一次查询） | 5.39 ms | **2.0 ms** | 第二次 `Path.resolve()` 与连接复用（中位；最小 1.9 ms） |
-| 评分整轮（700 件 × 8 角色） | 556 ms | **159 ms** | 角色级预计算 + 归一化缓存 |
-| 属性上限排除搜索（每轮） | 403 ms | **19.5 ms** | 复用已评分结果 |
-| 快照写入（600 件） | 209 ms | **185 ms** | `executemany` |
-| 装备详情曲线（53 属性） | 144 ms | **16 ms** | 每条曲线只读一次（1166 → 53 次查询） |
-| 配装目录重建 | 1174 ms（1417 条 SQL） | **1027 ms（887 条 SQL）** | GUI 线程阻塞已消除（F11）；读取本身减少 37% 查询（F13） |
-| 原生会话关闭的 GUI 线程等待（最坏） | ≈6 s | **≈2 s** | HUD 超时 2.0→0.5、快照域 1.5→0.4；实例不可用时跳过（**按超时参数估算，未实机计时**） |
+## 改动
 
-## 4. 已定位但未修复项（含原因）
+| # | 改动 | 验证 |
+| --- | --- | --- |
+| F1 | 新增 `tests/qt_application_fixture.py`（进程级唯一 GUI 应用），相关测试改用它；新增守卫禁止测试自建非 GUI 实例 | `tests/test_qt_application_isolation_boundaries.py`（2 条） |
+| F2 | 外键校验移入事务内、提交之前 | `tests/test_user_data_migration_foreign_key_rollback.py`（改动前红：`43 != 44`） |
+| F3 | `AppContext` 新增 `_run_switch_step`，stop/rebuild/notify/start 逐步隔离并记录告警 | `tests/test_app_context.py` 新增 3 条 |
+| F4 | 提交前置复核代次，抽出 `_is_stale_result` / `_stale_scan_stats` | `tests/test_streaming_scan_commit_boundaries.py`（改动前红） |
+| F5 | 评分角色级预计算 + 名称归一化缓存；属性上限搜索复用首轮结果（`reuse_scores`） | `tests/test_allocation_kernel_property_limits.py`（4 条，改动前 `1 != 2`） |
+| F6 | `_is_temp_path` 去二次 `Path.resolve()` 并缓存临时目录判定 | `tests/test_static_storage_perf.py` |
+| F7 | 快照写入改分组 `executemany`（写入顺序与事务边界不变） | 既有快照测试 |
+| F8 | 拆出 `static_game_data_character_growth_queries.py` 与 `static_game_data_weight_queries.py`（878 → 756 行） | `tests/test_repository_hygiene.py` |
+| F9 | DAO 新增 `evaluate_equipment_base_attribute_curve_levels`（一次读曲线、内存求值），`item_curves` 批量化并返回空曲线 | `tests/test_static_catalog_equipment_page_ui.py`（2 条，改动前红） |
+| F10 | DAO 新增 `deactivate_loadout_plans`（校验后单事务批量），控制器改用并在 `finally` 统一失效缓存与刷新 | `tests/test_loadout_plan_batch_deactivate_dao.py`（3 条） |
+| F11 | 抽出 `_read_and_apply_allocation_catalog` / `_start_allocation_catalog_worker`；GUI 宿主走 worker 并支持完成回调；`app.py` 收尾移入 `_finish_account_switch` | `tests/test_main_window_catalog_load_boundaries.py`（2 条，改动前红） |
+| F12 | 经裁定该兼容查找已无实际使用者，显式移除：`_role_avatar_index`、`_legacy_character_avatar`、`ROLE_AVATAR_ALIASES`、`normalize_role_avatar_name` 与回退调用，头像统一取 `equipped_character_icon_path` | 过时用例删除；受影响测试通过 |
+| F13 | 新增批量 DAO：`list_character_shape_bonuses`、`list_character_default_suits`、`list_character_likeability_bonuses`、`map_character_recommended_weights`、`list_character_weight_preferences`、`dataset_info`；图纸改用既有 `list_equipment_plans`；`project_equipment_items_to_max_level` 空输入短路；`load_official_role_detail` 的目录作用域与账号设置副本按请求缓存 | 实测 **1417 → 887 条 SQL（−37%）**、中位 **1174 → 1027 ms**；67 条相关测试通过、mypy 无新增 |
+| F14 | `_rows` 与 `close()`/`close_shared_connections()` 共用互斥锁（SQLite 为 serialized 模式，不引入连接池）；「连接已关闭」转为 `StaticGameDataError`；`MainWindow.closeEvent` 退出时回收共享连接 | `tests/test_static_connection_lifecycle_boundaries.py`（改动前 1 失败 1 报错） |
+| F15 | action 回包替换当前库存前，要求覆盖当前完整库存的全部 UID，否则回落到状态投影 + 冻结守卫（允许额外行=更新的完整回包，但不得缺行；与稳定器既有守卫同向，那里为严格相等） | `tests/test_warehouse_state_management.py::test_scoped_packet_never_replaces_the_official_inventory`（改动前失败）；同步路径既有守卫由 `tests/test_inventory_snapshot_stabilizer.py` 覆盖 |
+| F16 | `run` 增加 `finally` 释放 scanner，与同文件既有实现一致 | `tests/test_scan_worker_lifecycle_boundaries.py`（改动前红） |
+| F17 | HUD 超时 2.0→0.5、快照域 1.5→0.4；实例不可用时跳过快照关闭 RPC | 参数级改动；既有会话测试通过 |
 
-| # | 问题 | 证据 | 未修原因 |
-| --- | --- | --- | --- |
-| N1 | 正式库存指针可被「仅含本次变更 UID」的局部/按角色响应推进 → **已在 F15 中修复** | 见 F15 | 已收口为「覆盖当前完整库存才允许替换」；仍缺实机证据说明设备是否会给局部回包标记 `complete`（与 N2 同类举证问题） |
-| N2 | 轴分页缺 `complete` 字段时默认判为已完成（与最终化路径默认值相反） | 分页终止条件的实际决策点是 `integrations/nte_core_battle.parse_battle_axis`（`default=True`）；`storage/sqlite/battle_axis_dao.py:249,264` 同为 True；而 `battle_axis_finalization_dao.py:127,156` 用 False、`battle_capture_service.py:586` 缺省视为未完成。下游消费者拿到的都是解析后的页面，因此该分歧目前只在绕过解析层时才会显现 | 未改行为：设备是否总会发送该字段属实机/上游协议证据。已在解析点写明分歧与证据需求，并新增 `tests/test_battle_axis_complete_defaults.py` 固化当前判定，后续统一默认值会直接体现为测试差异 |
-| N3 | 配装目录重建仍约 1.0 s（一次重建 887 条 SQL），已从 GUI 线程移出但耗时未降到底 | 同 F11/F13 | 后台读取期间执行页会短暂保持旧目录；剩余耗时集中在 `load_official_role_detail` 的逐角色详情（约 500 条 SQL，见 N4） |
-| N4 | N+1 查询放大（剩余部分） | `official_role_page_service.load_official_role_detail` 被配装目录按角色调用（技能、觉醒、图纸、推荐权重等，约 500 条 SQL）；`weighted_shell.py:201-208` 仍有逐角色项 | 目录只需弧盘投影，需要一个「只算投影」的批量入口，涉及默认档案解析；F13 已消除其余放大项 |
-| N9 | 「清空配装」控制器路径缺少 Qt 层回归测试 | `equipment_display_controller.py` 的 `_clear_all_equipment` 依赖 `QMessageBox` | DAO 原子性已由 F10 的测试覆盖；控制器分支（失败提示、锁定跳过、`finally` 刷新）需 Qt 交互测试，本轮未补 |
-| N5 | 静态库共享连接跨线程保护与退出回收 → **已在 F14 中修复** | 见 F14 | 未采用连接池：`sqlite3.threadsafety == 3`，执行/关闭互斥已足够，且避免以锁换死锁 |
-| N6 | `ScanWorkerThread.run` 无 `finally` 释放 scanner → **已在 F16 中修复** | 见 F16 | 退出时主线程 `worker.wait(5000)`×3（`scanning/controller.py:230-235`）未改动：需实机观察退出耗时才能判断是否需要异步化 |
-| N7 | 装备域完整性由背包域标志代替；能力不足时沿用遗留 ready 布尔 | `work_mode_runtime.py:710-716`、`native_inventory_lease.py:77-95,135` | 属工作模式与原生能力判定，需实机核对各域真实能力 |
-| N10 | `warehouse.py` 的 `_template_root_candidates` / `_TEMPLATE_ROOTS` 在 F12 后成为只写不读的死访问器 | 头像路径删除后无人调用 | 保留：`configure_warehouse_view_template_roots` 是组合根 API（`app.py:147-153` 调用），简化或改名需要同时动 `app.py`，留待确认这是否算废弃入口 |
+## 影响
 
-## 5. 验证结果
+- 不修改 IPC 协议、采集/分析组件、`third_party` 的任何二进制与清单；游戏版本相关行为不变。
+- **不向上游 `main` 发起合并**：PR 基准为 `test`；分支重写后 force-push 到 fork 同名分支。
+- 未改变轴分页 `complete` 的判定行为：缺实机/上游协议证据，仅固化当前判定并标注所需证据
+  （`tests/test_battle_axis_complete_defaults.py`），后续统一默认值会直接体现为测试差异。
+- 头像遗留查找的移除依据：经维护者裁定该兼容查找已无实际使用者，不以目录是否存在作为理由。
+- 行为可见变化：账号切换不再卡 UI（目录后台加载）；「清空配装」原子化；退出时回收静态库连接；
+  局部回包不再替换正式库存。
+
+## 实测收益（`tools/quality/bench`，预热 + 多轮取中位）
+
+| 场景 | 修复前 | 当前 |
+| --- | --- | --- |
+| 静态库开连（含一次查询） | 5.39 ms | **2.0 ms** |
+| 评分整轮（700 件 × 8 角色） | 556 ms | **159 ms** |
+| 属性上限排除搜索（每轮） | 403 ms | **19.5 ms** |
+| 快照写入（600 件） | 209 ms | **185 ms** |
+| 装备详情曲线（53 属性） | 144 ms | **16 ms** |
+| 配装目录重建 | 1174 ms（1417 条 SQL） | **1027 ms（887 条 SQL）** |
+| 原生会话关闭的 GUI 线程等待（最坏） | ≈6 s | **≈2 s**（按超时参数估算，未实机计时） |
+
+## 已定位但未修复
+
+| # | 问题 | 未修原因 |
+| --- | --- | --- |
+| N2 | 轴分页缺 `complete` 字段时默认判为已完成（与最终化路径默认值相反） | 设备是否总会发送该字段属实机/上游协议证据；已固化当前判定并标注证据需求 |
+| N3 | 配装目录重建仍约 1.0 s（887 条 SQL），已从 GUI 线程移出 | 剩余耗时集中在 `load_official_role_detail` 的逐角色详情（约 500 条 SQL，见 N4） |
+| N4 | 逐角色 N+1 的剩余部分 | 目录只需弧盘投影，需要「只算投影」的批量入口，涉及默认档案解析 |
+| N7 | 装备域完整性由背包域标志代替 | 需实机核对各域真实能力 |
+| N9 | 「清空配装」控制器分支缺 Qt 层回归测试 | DAO 原子性已由 F10 覆盖；控制器交互需 Qt 测试 |
+| N10 | `_template_root_candidates` / `_TEMPLATE_ROOTS` 成为只写不读的死访问器 | `configure_warehouse_view_template_roots` 是组合根 API，简化需同时动 `app.py` |
+
+## 验证
 
 | 项目 | 结果 |
 | --- | --- |
-| `tools/quality/run_tests.py core -j 3` | **EXIT=0**：三分片各 `Ran 404 tests`，依次为 `OK (skipped=3)`、`OK`、`OK`（2026-09-28 12:22，`core-final.log`） |
-| `tools/quality/run_tests.py full` | 3043 条，1 个 error：`test_static_data_manifest` 缺 `dist` 中的 OCR 模型（既有环境问题，还原源码后同样失败）。**该行取自早前运行，当前提交未重跑** |
+| `tools/quality/run_tests.py core -j 3` | **EXIT=0**：三分片各 `Ran 404 tests`，依次 `OK (skipped=3)`、`OK`、`OK`（提交 `69966a9`；其后仅文档/测试删减与一处无行为变化的回退） |
 | `ruff check src tools tests` | `All checks passed!` |
-| `mypy` | 9 处既有报错，**无新增** |
-| `python -m tools.quality.bench` | 四场景稳定输出，见第 3 节 |
-
-### 勘误（本次自查发现并已更正）
-
-- **分片汇总行的误读**：早前用 `^OK$` 过滤日志，把 `OK (skipped=3)` 当成「缺少汇总行」，据此误报
-  「分片 1 崩溃」。实际最近三次全量 core（11:27、11:41、12:22）三分片均为 `OK`；
-  `OK (skipped=3)` 是正常的跳过统计，不是异常。
-- **现象归属**：F1 记载的「无汇总行 + 非 0 退出」在更早的基线中出现在**分片 3**，`git stash` A/B
-  确认它在本次改动之前就存在；之后三次全量 core 未再复现，因此**未能定位到具体模块**，怀疑与
-  本机 Qt/原生组件环境有关。F1 的修复保留，因为它消除的是一条可复现的进程级污染路径
-  （最小复现：两个模块同进程），与上述未复现现象不是同一件事。
-- **已回退的改动**：`StaticGameDataDao.summary()` 的逐表 COUNT 合并曾一并提交；复核发现
-  `dataset_info()` 已经消除了目录重建路径上的这 116 条 SQL，该改动对收益无贡献（回退后仍为
-  887 条），已回退以缩小改动面。
-- **已删除的测试**：一条「并发回收」测试在改动前后都能通过（SQLite 为 serialized 模式，本机
-  难以稳定命中竞态），属于无效测试，已删除；另删除一条仅验证显式值透传的冗余用例。
-
-## 6. 护栏与复核说明
-
-- 所有改动限定在 `_repo-perf`；`_repo` 的 `main`、`deploy.ps1`、`deploy_to_program_files.bat` 未触碰。
-- 未修改、打补丁或注入任何外部二进制、游戏程序或组件包；组件包相关结论均来自只读核对。
-- `docs/roadmap.md` 中 0.1 原生完整性实机验收、0.3 抓包启动时序、0.4 Windows 验收仍未完成，
-  本次未把它们当作缺陷，也未标记为已完成。
-- 失败分类：F1–F17 为本次修复；N1/N5/N6 已分别并入 F15/F14/F16；N2 未改行为，
-  N3/N4/N7/N9/N10 保留未修；FULL 的 `test_static_data_manifest` 为既有环境问题；
-  其余既有噪声（Qt 平台插件、缺少游戏运行环境）未作为缺陷计入。
-
-## 7. 变更范围与分支说明
-
-- 分支：`perf/snapshot-write-and-indexes`（fork `LGZhss/NTE-Drive-Calculator`）；PR #65 基准为上游
-  **`test`** 分支（按维护者要求，**不指向 `main`**，也未发起任何向上游 `main` 的合并）。
-- 未修改、打补丁或注入任何外部二进制、游戏程序或组件包；`third_party` 相关内容仅用于只读核对。
-- 头像遗留查找的移除依据：**经维护者裁定「该兼容查找已无实际使用者」后显式移除**，
-  不以任何目录是否存在作为理由（此前基于死路径的论证已被撤回，见第 5 节勘误）。
-- N2（轴分页 `complete` 默认值）**未改变行为**：只固化当前判定并写明所需证据；统一默认值需要
-  实机/上游协议证据，届时 `tests/test_battle_axis_complete_defaults.py` 会直接体现为差异。
-- 复核原则：每项改动都需回答「为什么必要、用什么证明」；不能证明收益或不改变行为的改动
-  （如 `summary()` 合并）一律回退；改动前后都能通过的测试一律删除。
+| `mypy` | 既有报错不变，无新增（改动文件逐个 A/B 对比） |
+| `tools/quality/bench` | 场景稳定输出，见实测收益表 |
+| `run_tests.py full` | 早前运行 3043 条、1 个 error（`test_static_data_manifest` 缺 `dist` 中 OCR 模型，既有环境问题）；当前提交未重跑 |
