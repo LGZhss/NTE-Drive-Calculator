@@ -586,9 +586,10 @@ class WarehouseStateManagementService:
             if user_dao.current_inventory_snapshot_id() != plan.snapshot_id:
                 return None
             # 状态 RPC 可能只回传本次变更的局部/按角色快照；即便它声明 complete，
-            # 用它替换当前库存也会把其余装备从正式库存里抹掉（与 apply 中「局部
-            # 响应应被忽略而不是导入为当前库存」的冻结守卫一致）。因此只有覆盖
-            # 当前完整库存全部 UID 的响应才允许替换。
+            # 用它替换当前库存也会把其余装备从正式库存里抹掉。同步路径早在
+            # ``InventorySnapshotStabilizer.offer(required_uids=...)`` 里施加了同一
+            # 不变量（那里用严格相等，因为其目标是「冻结库存未变」）；这里允许
+            # packet 含额外行——那是更新的完整回包，但不能缺少任何一行。
             current_uids = {
                 (int(row["uid_slot"]), int(row["uid_serial"]))
                 for row in user_dao.list_inventory_items(plan.snapshot_id)
