@@ -46,6 +46,20 @@ def get_effective_character_shape_bonus(
     return bundled
 
 
+def get_effective_character_shape_bonuses(
+    static_dao: StaticGameDataDao,
+    *,
+    shared_database_path: str | Path | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Return the release-static rules; legacy shared overrides never participate."""
+    del shared_database_path
+    bonuses = static_dao.list_character_shape_bonuses()
+    for bundled in bonuses.values():
+        if bundled is not None:
+            bundled["effective_source"] = "static_default"
+    return bonuses
+
+
 def character_shape_profile_fields(
     shape_bonus: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
