@@ -11,7 +11,9 @@ from src.models.equipment import DriveShape
 from src.solver.blueprint_utils import dedupe_blueprints_by_piece_signature
 from src.solver.combinatorics import PuzzleCombinatorics
 from src.solver.dfs_puzzle import DFSPuzzleSolver
-from src.services.character_shape_bonus_service import get_effective_character_shape_bonus
+from src.services.character_shape_bonus_service import (
+    get_effective_character_shape_bonuses
+)
 from src.storage.sqlite.static_game_data_dao import StaticGameDataDao
 
 
@@ -210,12 +212,22 @@ def solve_blueprints_from_static(
     solver = DFSPuzzleSolver(shape_models)
     results: dict[str, dict] = {}
 
+    plans_by_char = {
+        int(plan["character_id"]): plan
+        for plan in static_dao.list_equipment_plans()
+    }
+    suits_by_id = {str(suit["suit_id"]): suit for suit in static_dao.list_suits()}
+    shape_bonuses_by_char = get_effective_character_shape_bonuses(
+        static_dao, shared_database_path=shared_database_path
+    )
+
     for character in static_dao.list_characters():
-        plan = static_dao.get_equipment_plan(int(character["character_id"]))
+        char_id = int(character["character_id"])
+        plan = plans_by_char.get(char_id)
         if plan is None:
             continue
         core = core_items.get(str(plan.get("core_item_id") or ""))
-        suit = static_dao.get_suit(str((core or {}).get("suit_id") or ""))
+        suit = suits_by_id.get(str((core or {}).get("suit_id") or ""))
         set_piece_ids = [
             shape_id
             for shape_id in (suit or {}).get("required_shape_ids", [])
@@ -225,11 +237,7 @@ def solve_blueprints_from_static(
             continue
 
         board = official_board(plan)
-        shape_bonus = get_effective_character_shape_bonus(
-            static_dao,
-            int(character["character_id"]),
-            shared_database_path=shared_database_path,
-        ) or {}
+        shape_bonus = shape_bonuses_by_char.get(char_id) or {}
         preferred_label = _public_extra_shape_label(
             shape_bonus,
             shape_models,

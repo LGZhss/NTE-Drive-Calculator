@@ -364,6 +364,40 @@ class StaticGameDataDao(
         )
         return row
 
+    def list_character_shape_bonuses(self) -> dict[int, dict[str, Any]]:
+        rows = self._rows(
+            """
+            SELECT a.character_id, a.logical_character_key,
+                   b.representative_character_id, b.shape_label,
+                   b.shape_grid_count, b.source_kind
+            FROM character_annotation AS a
+            JOIN logical_character_shape_bonus AS b
+              ON b.logical_character_key = a.logical_character_key
+            """
+        )
+        by_char_id = {int(row["character_id"]): dict(row) for row in rows}
+
+        properties = self._rows(
+            """
+            SELECT p.logical_character_key, p.property_id, p.display_value, p.ordinal,
+                   a.display_name_zh, a.filter_name_zh, a.show_percent
+            FROM logical_character_shape_bonus_property AS p
+            JOIN equipment_attribute AS a
+              ON a.attribute_id = p.property_id
+            ORDER BY p.logical_character_key, p.ordinal
+            """
+        )
+
+        props_by_key = {}
+        for prop in properties:
+            key = prop.pop("logical_character_key")
+            props_by_key.setdefault(key, []).append(dict(prop))
+
+        for char_id, row in by_char_id.items():
+            row["properties"] = props_by_key.get(row["logical_character_key"], [])
+
+        return by_char_id
+
     def list_characters(self) -> list[dict[str, Any]]:
         return self._rows(
             """
