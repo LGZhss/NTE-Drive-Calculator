@@ -261,11 +261,13 @@ def solve_blueprints_from_static(
             "preferred_extra_label": preferred_label or "无特定偏好",
             "blueprints": candidates,
         }
+    _suit_cache = {}
     for custom in custom_characters:
         character_id = int(custom["character_id"])
         role_name = str(custom.get("name_zh") or character_id)
         target_suit_id = str(custom.get("target_suit_id") or "")
-        suit = static_dao.get_suit(target_suit_id) if target_suit_id else None
+        if target_suit_id not in _suit_cache: _suit_cache[target_suit_id] = static_dao.get_suit(target_suit_id)
+        suit = _suit_cache.get(target_suit_id) if target_suit_id else None
         set_piece_ids = [
             shape_id
             for shape_id in (suit or {}).get("required_shape_ids", [])
